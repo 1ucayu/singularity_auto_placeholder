@@ -182,7 +182,12 @@ def stop_process(process: subprocess.Popen, timeout: float = 10) -> None:
 
 def run_child(command: list[str], environment: dict[str, str], stop: threading.Event,
               logger: logging.Logger, timeout: float | None = None) -> int:
-    process = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
+    # Exec through a tiny child-side helper, avoiding preexec_fn in this
+    # threaded process. On Linux the CLI receives SIGTERM if this helper is
+    # killed, so the session's restart loop does not leave competing tunnels.
+    guarded = [sys.executable, str(Path(__file__).with_name("parent_exec.py")),
+               "--parent-pid", str(os.getpid()), "--", *command]
+    process = subprocess.Popen(guarded, env=environment, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, errors="replace", bufsize=1, start_new_session=True)
 

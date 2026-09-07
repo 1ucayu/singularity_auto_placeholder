@@ -74,7 +74,7 @@ AML 创建新 job 并挂载 Blob
   → 固定镜像 / 锁文件重建运行依赖
   → 验证 Blob 模型并 stage 到本地
   → 选择最后完整 checkpoint 或未完成 trace 分片
-  → 启动 foreground supervisor 与 tunnel
+  → 独立启动 GPU supervisor 与 tunnel；外层 sleep 保持主命令
   → 用 placeholder run 启动服务或实验
   → 周期性持久化新结果
 ```

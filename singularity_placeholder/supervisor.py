@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -284,56 +284,87 @@ class Worker:
     process: subprocess.Popen[str]
     aliases: set[int]
     reader: threading.Thread
+    ready: threading.Event = field(default_factory=threading.Event)
+    started_at: float = field(default_factory=time.monotonic)
 
 
 class WorkerPool:
-    def __init__(self, stop_seconds: float = 10.0):
+    def __init__(self, stop_seconds: float = 10.0, startup_seconds: float = 120.0):
         self.workers: dict[str, Worker] = {}
         self.stop_seconds = stop_seconds
+        self.startup_seconds = startup_seconds
 
     def own_pids(self, gpu: str) -> set[int]:
         worker = self.workers.get(gpu)
         if worker is None or worker.process.poll() is not None:
             return set()
-        # Each set contains one verified NVML/host PID, never mixed namespace IDs.
+        # Never mix container-local PIDs with the NVIDIA process namespace.
         return set(worker.aliases)
 
     def exited(self) -> list[tuple[str, int]]:
         return [(gpu, code) for gpu, worker in self.workers.items() if (code := worker.process.poll()) is not None]
 
     @staticmethod
-    def _verify_pid_namespace() -> None:
+    def _host_pid_namespace() -> bool:
         if not sys.platform.startswith("linux"):
-            return  # CPU-only control tests also run on macOS.
+            return True  # CPU-only control tests also run on macOS.
         try:
             current = os.readlink("/proc/self/ns/pid")
             proc_root = os.readlink("/proc/1/ns/pid")
-        except OSError as exc:
-            raise RuntimeError("Cannot verify the PID namespace used for NVIDIA process ownership") from exc
-        # Linux reserves this nsfs inode for init_pid_ns (PROC_PID_INIT_INO).
-        # NSpid is relative to the namespace mounting procfs, so its first value
-        # alone is NOT evidence of a host PID when procfs is container-local.
-        if current != "pid:[4026531836]" or proc_root != current:
-            raise RuntimeError(
-                "Cannot safely map nvidia-smi host PIDs to this isolated PID namespace. "
-                "No placeholder was launched. Use a job with host PID visibility and "
-                "an aligned host /proc mount; namespace-local NSpid aliases are insufficient."
-            )
+        except OSError:
+            return False
+        return current == "pid:[4026531836]" and proc_root == current
 
     @staticmethod
     def _pid_aliases(pid: int) -> set[int]:
-        WorkerPool._verify_pid_namespace()
-        if sys.platform.startswith("linux"):
-            try:
-                for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                    if line.startswith("NSpid:"):
-                        pids = [int(token) for token in line.split()[1:]]
-                        if not pids or pids[0] != pid:
-                            raise RuntimeError("Worker PID does not match the verified host procfs namespace")
-                        return {pids[0]}
-            except (OSError, ValueError) as exc:
-                raise RuntimeError("Cannot verify the worker's NVIDIA host PID") from exc
-        return {pid}
+        return {pid} if WorkerPool._host_pid_namespace() else set()
+
+    def ready_gpus(self) -> set[str]:
+        """Capture readiness before the next NVIDIA query, never afterward."""
+        return {gpu for gpu, worker in self.workers.items()
+                if worker.ready.is_set() and worker.process.poll() is None}
+
+    def observe_processes(
+        self, processes: Sequence[tuple[str, int]], ready_before_sample: set[str],
+        *, now: float | None = None,
+    ) -> tuple[dict[str, set[int]], set[str], dict[str, str]]:
+        """Associate a ready worker with its single NVIDIA PID on an idle GPU.
+
+        start() is called only after the supervisor observes no external CUDA
+        processes. Workers retain a direct CUDA context after READY. A query
+        begun after READY can therefore identify the sole process, even when
+        its host PID differs from the container PID. Multiple processes always
+        yield the GPU. During initialization a singleton remains provisional;
+        it is never stored as ownership before READY or beyond the timeout.
+        """
+        now = time.monotonic() if now is None else now
+        by_gpu: dict[str, set[int]] = {}
+        for gpu, pid in processes:
+            by_gpu.setdefault(gpu, set()).add(pid)
+        foreign = {gpu: set(pids) for gpu, pids in by_gpu.items()}
+        starting: set[str] = set()
+        errors: dict[str, str] = {}
+        for gpu, worker in self.workers.items():
+            if worker.process.poll() is not None:
+                continue
+            pids = by_gpu.get(gpu, set())
+            if worker.aliases:
+                foreign[gpu] = pids - worker.aliases
+            elif len(pids) > 1:
+                continue  # Ambiguous startup: yield instead of claiming any PID.
+            elif gpu in ready_before_sample and len(pids) == 1:
+                worker.aliases = set(pids)
+                foreign[gpu] = set()
+                LOG.info("Associated worker gpu=%s container_pid=%s nvidia_pid=%s",
+                         gpu, worker.process.pid, next(iter(pids)))
+            else:
+                foreign[gpu] = set()  # Temporary startup allowance, not ownership.
+            if not worker.ready.is_set() or not worker.aliases:
+                if now - worker.started_at >= self.startup_seconds:
+                    errors[gpu] = f"CUDA worker readiness/PID discovery exceeded {self.startup_seconds:g}s"
+                else:
+                    starting.add(gpu)
+        return foreign, starting, errors
 
     def start(self, gpus: Sequence[str]) -> None:
         requested = tuple(gpus)
@@ -341,7 +372,6 @@ class WorkerPool:
             raise RuntimeError("Cannot start a duplicate worker on a GPU")
         if not requested:
             return
-        self._verify_pid_namespace()
         added: list[str] = []
         try:
             for gpu in requested:
@@ -351,24 +381,30 @@ class WorkerPool:
                 for name in ("VSCODE_CLI_ACCESS_TOKEN", "VSCODE_CLI_REFRESH_TOKEN"):
                     env.pop(name, None)
                 process = subprocess.Popen(
-                    [sys.executable, "-m", "singularity_placeholder.worker", "--gpu", gpu],
+                    [sys.executable, "-m", "singularity_placeholder.worker", "--gpu", gpu,
+                     "--parent-pid", str(os.getpid())],
                     env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, start_new_session=True,
                 )
 
-                def consume(output: Any = process.stdout, label: str = gpu) -> None:
+                ready = threading.Event()
+                marker = f"PLACEHOLDER_READY gpu={gpu} pid={process.pid}"
+
+                def consume(output: Any = process.stdout, label: str = gpu,
+                            ready_event: threading.Event = ready, ready_marker: str = marker) -> None:
                     try:
                         for line in output:
+                            if line.strip() == ready_marker:
+                                ready_event.set()
                             LOG.info("worker %s: %s", label, line.rstrip()[:8192])
                     finally:
                         output.close()
 
                 reader = threading.Thread(target=consume, name=f"log-{gpu}", daemon=True)
-                worker = Worker(gpu, process, set(), reader)
+                worker = Worker(gpu, process, self._pid_aliases(process.pid), reader, ready)
                 self.workers[gpu] = worker
                 added.append(gpu)
                 reader.start()
-                worker.aliases = self._pid_aliases(process.pid)
                 LOG.info("Started worker gpu=%s pid=%s", gpu, process.pid)
         except BaseException:
             self.stop(added)
@@ -454,16 +490,17 @@ class Supervisor:
             inventory, count=config.gpu_count, selectors=config.gpus, environ=environ,
             cuda_visible=cuda_visible,
         )
+        if len(self.selected) != config.gpu_count:
+            LOG.warning("Requested %s GPUs but discovered %s usable GPUs; continuing with the visible allocation",
+                        config.gpu_count, len(self.selected))
         if sys.platform.startswith("linux"):
             for label, path in (("current", "/proc/self/ns/pid"), ("proc_root", "/proc/1/ns/pid")):
                 try:
                     LOG.info("PID namespace %s: %s", label, os.readlink(path))
                 except OSError as exc:
                     LOG.warning("PID namespace %s is unreadable: %s", label, exc)
-            try:
-                WorkerPool._verify_pid_namespace()
-            except RuntimeError as exc:
-                LOG.error("Automatic placeholder workers are unavailable in this PID namespace: %s", exc)
+            if not WorkerPool._host_pid_namespace():
+                LOG.info("Container PID namespace: worker NVIDIA PIDs will be learned after CUDA readiness")
         self.reservations = Reservations(self.control)
         self.daemon = {**identity_record(os.getpid()), "session": uuid.uuid4().hex}
         self.idle_since: dict[str, float] = {}
@@ -510,11 +547,16 @@ class Supervisor:
         paused = (self.control / "paused.json").exists()
         snapshot, monitor_error = None, None
         foreign: dict[str, set[int]] = {gpu: set() for gpu in self.selected}
+        starting: set[str] = set()
+        startup_errors: dict[str, str] = {}
         try:
+            ready_before_sample = self.pool.ready_gpus()
             snapshot = self.monitor.sample(self.selected)
-            for gpu, pid in snapshot.processes:
-                if pid not in self.pool.own_pids(gpu):
-                    foreign[gpu].add(pid)
+            observed, starting, startup_errors = self.pool.observe_processes(
+                snapshot.processes, ready_before_sample, now=now,
+            )
+            for gpu in self.selected:
+                foreign[gpu] = observed.get(gpu, set())
         except (MonitorError, OSError) as exc:
             monitor_error = str(exc)
         global_block: tuple[str, str] | None = None
@@ -551,15 +593,17 @@ class Supervisor:
             elif foreign[gpu]:
                 state, reason = "external_workload", "External CUDA PID detected on this GPU"
                 if gpu in self.pool.workers:
-                    # An unknown host/container PID may be our own worker under
-                    # an inaccessible PID namespace. Never classify it by guess.
                     self.retry_after[gpu] = now + self.config.worker_retry_seconds
-                    reason += "; unknown PID identity is treated as foreign (including namespace mismatch)"
+            elif gpu in startup_errors:
+                self.retry_after[gpu] = now + self.config.worker_retry_seconds
+                state, reason = "worker_error", startup_errors[gpu]
             elif gpu in exited:
                 self.retry_after[gpu] = now + self.config.worker_retry_seconds
                 state, reason = "worker_error", f"Owned worker exited {exited[gpu]}; retry after backoff"
             elif now < self.retry_after.get(gpu, 0):
                 state, reason = "worker_backoff", "Waiting before retrying this GPU"
+            elif gpu in starting:
+                state, reason = "worker_starting", "Waiting for CUDA readiness and NVIDIA process discovery"
             elif gpu not in self.pool.workers:
                 if reading.utilization > self.config.max_utilization or reading.memory_mib > self.config.max_memory_mib:
                     state, reason = "gpu_busy", "Utilization or memory exceeds the idle thresholds"
@@ -571,7 +615,7 @@ class Supervisor:
                     else:
                         state, reason = "start_pending", "This GPU passed the idle checks"
                         start_set.append(gpu)
-            if state not in {"running", "idle_grace", "start_pending"}:
+            if state not in {"running", "worker_starting", "idle_grace", "start_pending"}:
                 self.idle_since.pop(gpu, None)
                 stop_set.add(gpu)
             gpu_states[gpu] = {
@@ -606,7 +650,7 @@ class Supervisor:
                     self.idle_since.pop(gpu, None)
                     gpu_states[gpu] = {"state": "worker_error", "reason": f"Worker startup failed: {exc}"}
         states = {item["state"] for item in gpu_states.values()}
-        priority = ("stopping", "reserved", "external_workload", "worker_error", "worker_backoff", "gpu_busy", "idle_grace", "start_pending", "running")
+        priority = ("stopping", "reserved", "external_workload", "worker_error", "worker_backoff", "gpu_busy", "idle_grace", "start_pending", "worker_starting", "running")
         aggregate = next(state for state in priority if state in states)
         return self._publish(
             aggregate, "Each GPU independently yields to real work and resumes after its idle grace period",

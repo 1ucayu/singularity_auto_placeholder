@@ -1,4 +1,4 @@
-"""Azure ML entrypoint: local runtime, foreground supervisor, optional tunnel."""
+"""Run the GPU supervisor and VS Code tunnel as independent, restartable services."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import time
+import threading
+from dataclasses import dataclass
 import uuid
 
 
@@ -31,7 +32,8 @@ def parser() -> argparse.ArgumentParser:
                         help="Actual mounted directory: pass Azure ML ${{inputs.lucayu}}")
     result.add_argument("--blob-prefix", default="lucayu/sglang")
     result.add_argument("--local-root", type=Path, default=default_local_root())
-    result.add_argument("--gpu-count", type=int, default=8)
+    result.add_argument("--gpu-count", type=int, default=8,
+                        help="Expected GPU count; a mismatch does not block startup")
     result.add_argument("--gpus", help="Explicit allocated physical GPU UUIDs, comma separated")
     result.add_argument("--idle-seconds", type=float, default=30)
     result.add_argument("--poll-seconds", type=float, default=1)
@@ -39,34 +41,22 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-memory-mib", type=int, default=256)
     result.add_argument("--tunnel", action="store_true")
     result.add_argument("--tunnel-name", default="aml-lucayu")
-    result.add_argument("--debug-grace-seconds", type=float, default=600,
-                        help="Keep an enabled tunnel alive this long after supervisor failure (0 disables)")
+    result.add_argument("--retry-seconds", type=float, default=10,
+                        help="Delay before restarting a failed service or retrying Blob setup")
     return result
 
 
-def supervisor_failure_action(returncode: int, *, tunnel_enabled: bool,
-                              grace_seconds: float, now: float, deadline: float | None) -> tuple[bool, float | None]:
-    """Return (should_exit, deadline), keeping a bounded tunnel debugging window."""
-    if returncode == 0 or not tunnel_enabled or grace_seconds <= 0:
-        return True, deadline
-    if deadline is None:
-        deadline = now + grace_seconds
-    return now >= deadline, deadline
-
-
 def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str]:
-    mount = args.blob_root.expanduser().resolve(strict=True)
-    if not mount.is_dir():
-        raise ValueError("--blob-root must be the mounted directory, not an azureml:// URI")
+    # Do not touch Blob here: a slow/unavailable mount must not delay the tunnel.
+    mount = Path(os.path.abspath(args.blob_root.expanduser()))
     prefix = Path(args.blob_prefix)
     if prefix.is_absolute() or ".." in prefix.parts or not prefix.parts:
         raise ValueError("--blob-prefix must be a nonempty relative path without '..'")
-    persistent = (mount / prefix).resolve()
-    if not persistent.is_relative_to(mount):
-        raise ValueError("Blob prefix escapes the supplied mount")
-    local = args.local_root.expanduser().resolve()
+    persistent = mount / prefix
+    local = Path(os.path.abspath(args.local_root.expanduser()))
     if local.is_relative_to(mount) or mount.is_relative_to(local):
         raise ValueError("--local-root must be separate from Blob; use a node-local SSD directory")
+    local = local.resolve()
     # Keep generated launchers and control files private. Blob ACLs are managed
     # by Azure, so chmod on the Blob mount is intentionally not used.
     local.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -75,11 +65,8 @@ def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str]:
     local.chmod(0o700)
     for name in ("bin", "control", "logs", "workspace", "cache", "tmp", "outputs", "tunnel"):
         (local / name).mkdir(exist_ok=True, mode=0o700)
-    for name in ("models", "datasets", "traces/input", "runs", "sessions", "code-snapshots"):
-        (persistent / name).mkdir(parents=True, exist_ok=True)
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     (local / "outputs" / run_id).mkdir()
-    (persistent / "sessions" / run_id).mkdir()
     return {"mount": mount, "persistent": persistent, "local": local, "run_id": run_id}
 
 
@@ -119,28 +106,102 @@ def write_environment(paths: dict[str, Path | str], repo: Path) -> dict[str, str
     return values
 
 
-def preflight() -> None:
-    if sys.platform != "linux":
-        raise RuntimeError("The AML runtime must be Linux with NVIDIA CUDA GPUs")
-    if not shutil.which("nvidia-smi"):
-        raise RuntimeError("nvidia-smi is missing; select a GPU-enabled Azure ML environment")
-    subprocess.run(
-        [sys.executable, "-c", "import torch; assert torch.cuda.is_available(), 'CUDA-enabled torch required'"],
-        check=True, timeout=90,
-    )
+
+def prepare_storage(paths: dict[str, Path | str], gpu_count: int) -> None:
+    """Best-effort durable layout; called in a thread, never on the tunnel path."""
+    mount, persistent = Path(paths["mount"]), Path(paths["persistent"])
+    if not mount.is_dir():
+        raise OSError(f"Blob mount is not available: {mount}")
+    for name in ("models", "datasets", "traces/input", "runs", "sessions", "code-snapshots"):
+        (persistent / name).mkdir(parents=True, exist_ok=True)
+    durable_session = persistent / "sessions" / str(paths["run_id"])
+    durable_session.mkdir(exist_ok=True)
+    manifest = {
+        "run_id": paths["run_id"], "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "azureml_run_id": os.environ.get("AZUREML_RUN_ID"),
+        "gpu_count_requested": gpu_count,
+        "blob_root": str(persistent), "local_root": str(paths["local"]),
+        "python": sys.version.split()[0],
+    }
+    (durable_session / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def storage_loop(paths: dict[str, Path | str], gpu_count: int,
+                 stopping: threading.Event, retry_seconds: float) -> None:
+    while not stopping.is_set():
+        try:
+            prepare_storage(paths, gpu_count)
+            if not stopping.is_set():
+                log(f"Blob personal directory ready: {paths['persistent']}")
+            return
+        except OSError as exc:
+            log(f"Blob setup pending: {exc}; retrying in {retry_seconds:g}s. Local services continue.")
+        stopping.wait(retry_seconds)
+
+
+@dataclass
+class Service:
+    name: str
+    command: list[str]
+    env: dict[str, str]
+    process: subprocess.Popen | None = None
+    retry_at: float = 0
+
+    def tick(self, now: float, retry_seconds: float) -> None:
+        if self.process is not None:
+            result = self.process.poll()
+            if result is None:
+                return
+            log(f"{self.name} exited with code {result}; restarting in {retry_seconds:g}s. Other services continue.")
+            self.process = None
+            self.retry_at = now + retry_seconds
+        if now < self.retry_at:
+            return
+        try:
+            self.process = subprocess.Popen(self.command, env=self.env, start_new_session=True)
+            log(f"Started {self.name} (pid {self.process.pid})")
+        except OSError as exc:
+            log(f"Cannot start {self.name}: {exc}; retrying in {retry_seconds:g}s")
+            self.retry_at = now + retry_seconds
+
+
+def run_services(services: list[Service], stopping: threading.Event,
+                 retry_seconds: float) -> None:
+    """A failed service never stops its siblings or the session."""
+    try:
+        while not stopping.is_set():
+            for service in services:
+                service.tick(time.monotonic(), retry_seconds)
+            stopping.wait(0.25)
+    finally:
+        children = [service.process for service in services if service.process is not None]
+        for child in reversed(children):
+            if child.poll() is None:
+                try:
+                    os.killpg(child.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 20
+        for child in reversed(children):
+            try:
+                child.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,19}", args.tunnel_name):
         raise SystemExit("--tunnel-name must be 1-20 letters/digits/hyphens, starting with a letter or digit")
-    if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.debug_grace_seconds < 0:
-        raise SystemExit("GPU count and poll interval must be positive; idle interval must be nonnegative")
-    preflight()
+    if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.retry_seconds <= 0:
+        raise SystemExit("GPU count, poll interval and retry interval must be positive; idle interval must be nonnegative")
     paths = prepare_paths(args)
     local = Path(paths["local"])
     repo = Path(__file__).resolve().parents[1]
-    # A second entrypoint must not overwrite another session's launchers/env.
     import fcntl
     with (local / "session.lock").open("a") as session_lock:
         try:
@@ -156,18 +217,16 @@ def main(argv: list[str] | None = None) -> int:
         supervisor_env = child_env.copy()
         for name in ("VSCODE_CLI_ACCESS_TOKEN", "VSCODE_CLI_REFRESH_TOKEN"):
             supervisor_env.pop(name, None)
-        manifest = {
-            "run_id": paths["run_id"], "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "azureml_run_id": os.environ.get("AZUREML_RUN_ID"),
-            "gpu_count_requested": args.gpu_count,
-            "blob_root": str(paths["persistent"]), "local_root": str(local),
-            "python": sys.version.split()[0],
-        }
-        durable_session = Path(paths["persistent"]) / "sessions" / str(paths["run_id"])
-        (durable_session / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        log(f"Blob personal directory: {paths['persistent']}")
         log(f"In a new VS Code terminal: source {shlex.quote(str(local / 'env.sh'))}")
         log("Then: placeholder status | placeholder run -- python your_script.py")
+        services = []
+        # Start the tunnel first. No CUDA, PyTorch or Blob checks gate connectivity.
+        if args.tunnel:
+            services.append(Service("tunnel", [
+                sys.executable, "-u", "-m", "singularity_placeholder.tunnel",
+                "--runtime-dir", str(local / "tunnel"), "--name", args.tunnel_name,
+                "--log-dir", str(local / "logs" / "tunnel"),
+            ], child_env))
         command = [sys.executable, "-u", "-m", "singularity_placeholder", "supervise",
                    "--control-dir", str(local / "control"), "--state-dir", str(local / "logs"),
                    "--gpu-count", str(args.gpu_count), "--idle-seconds", str(args.idle_seconds),
@@ -175,69 +234,21 @@ def main(argv: list[str] | None = None) -> int:
                    "--max-memory-mib", str(args.max_memory_mib)]
         if args.gpus:
             command += ["--gpus", args.gpus]
-        children: list[subprocess.Popen] = []
-        stopping = False
-
-        def stop(_signum: int, _frame: object) -> None:
-            nonlocal stopping
-            stopping = True
-
+        services.append(Service("GPU supervisor", command, supervisor_env))
+        stopping = threading.Event()
+        old_handlers = {}
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(sig, stop)
-        exit_code = 0
+            old_handlers[sig] = signal.signal(sig, lambda *_: stopping.set())
+        storage = threading.Thread(target=storage_loop, args=(paths, args.gpu_count, stopping, args.retry_seconds),
+                                   name="blob-setup", daemon=True)
+        storage.start()
         try:
-            supervisor = subprocess.Popen(command, env=supervisor_env, start_new_session=True)
-            children.append(supervisor)
-            if args.tunnel:
-                tunnel = subprocess.Popen(
-                    [sys.executable, "-u", "-m", "singularity_placeholder.tunnel",
-                     "--runtime-dir", str(local / "tunnel"), "--name", args.tunnel_name,
-                     "--log-dir", str(local / "logs" / "tunnel")],
-                    env=child_env, start_new_session=True,
-                )
-                children.append(tunnel)
-            tunnel_reported = False
-            failure_deadline: float | None = None
-            while not stopping:
-                result = supervisor.poll()
-                if result is not None:
-                    exit_code = result if result >= 0 else 128 - result
-                    first_failure = failure_deadline is None
-                    should_exit, failure_deadline = supervisor_failure_action(
-                        result, tunnel_enabled=args.tunnel and tunnel.poll() is None,
-                        grace_seconds=args.debug_grace_seconds,
-                        now=time.monotonic(), deadline=failure_deadline,
-                    )
-                    if should_exit:
-                        log(f"supervisor exited with code {result}; ending job entrypoint")
-                        break
-                    if first_failure:
-                        log(f"supervisor exited with code {result}; GPU supervision stopped; check worker state. "
-                            f"Keeping the tunnel available for up to {args.debug_grace_seconds:g}s for diagnostics; "
-                            "the platform may still reclaim the job.")
-                if args.tunnel and tunnel.poll() is not None and not tunnel_reported:
-                    supervisor_state = "GPU supervisor continues" if result is None else "GPU supervisor has also exited"
-                    log(f"tunnel helper exited with code {tunnel.returncode}; see tunnel logs; {supervisor_state}")
-                    tunnel_reported = True
-                time.sleep(0.25)
+            run_services(services, stopping, args.retry_seconds)
         finally:
-            for child in reversed(children):
-                if child.poll() is None:
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            deadline = time.monotonic() + 60
-            for child in reversed(children):
-                try:
-                    child.wait(timeout=max(0.1, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(child.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    child.wait()
-        return exit_code
+            stopping.set()
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
+        return 0
 
 
 if __name__ == "__main__":

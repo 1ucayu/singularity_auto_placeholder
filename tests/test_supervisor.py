@@ -5,13 +5,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from singularity_placeholder.monitor import GPU, MonitorError, Snapshot
 from singularity_placeholder.supervisor import (
-    Config, DaemonLock, Reservations, Supervisor, atomic_json,
+    Config, DaemonLock, Reservations, Supervisor, Worker, WorkerPool, atomic_json,
     ensure_local_control_dir, identity_alive, identity_record, process_identity, resolve_run_gpus,
 )
 
@@ -41,6 +42,16 @@ class FakePool:
 
     def own_pids(self, gpu):
         return {self.workers[gpu]} if gpu in self.workers else set()
+
+    def ready_gpus(self):
+        return set(self.workers)
+
+    def observe_processes(self, processes, ready_before_sample, *, now=None):
+        foreign = {}
+        for gpu, pid in processes:
+            if pid not in self.own_pids(gpu):
+                foreign.setdefault(gpu, set()).add(pid)
+        return foreign, set(), {}
 
     def public(self):
         return self.workers.copy()
@@ -88,6 +99,80 @@ class SupervisorTests(unittest.TestCase):
             )
         self.assertEqual(supervisor.selected, cuda)
         probe.assert_called_once_with(environ={"NVIDIA_VISIBLE_DEVICES": ""})
+
+    def test_gpu_count_mismatch_warns_and_uses_discovered_allocation(self):
+        with self.assertLogs("singularity_placeholder", level="WARNING") as logs:
+            supervisor = Supervisor(
+                Config(self.control, Path(self.temp.name) / "logs", gpu_count=8),
+                monitor=self.monitor, pool=self.pool, environ={},
+            )
+        self.assertEqual(supervisor.selected, ("GPU-A", "GPU-B"))
+        self.assertIn("continuing with the visible allocation", "\n".join(logs.output))
+
+    def use_isolated_pool(self, *, ready=True):
+        pool = WorkerPool()
+        reader = threading.Thread(target=lambda: None)
+        reader.start()
+        reader.join()
+        for gpu, pid in (("GPU-A", 42), ("GPU-B", 43)):
+            process = Mock(pid=pid)
+            process.poll.return_value = None
+            worker = Worker(gpu, process, set(), reader, started_at=0)
+            if ready:
+                worker.ready.set()
+            pool.workers[gpu] = worker
+
+        def stop(gpus):
+            for gpu in gpus:
+                pool.workers.pop(gpu, None)
+            return True
+
+        pool.stop = Mock(side_effect=stop)
+        pool.start = Mock()
+        self.supervisor.pool = pool
+        self.monitor.processes = (("GPU-A", 9000), ("GPU-B", 9001))
+        return pool
+
+    def test_isolated_container_workers_do_not_churn_on_host_pids(self):
+        pool = self.use_isolated_pool()
+        self.assertEqual(self.supervisor.step(1)["state"], "running")
+        self.assertEqual(pool.own_pids("GPU-A"), {9000})
+        self.assertEqual(pool.own_pids("GPU-B"), {9001})
+        self.assertEqual(self.supervisor.step(2)["state"], "running")
+        self.assertEqual(set(pool.workers), {"GPU-A", "GPU-B"})
+        pool.start.assert_not_called()
+
+    def test_isolated_worker_yields_only_gpu_with_extra_foreign_process(self):
+        pool = self.use_isolated_pool()
+        self.supervisor.step(1)
+        self.monitor.processes += (("GPU-A", 9999),)
+        result = self.supervisor.step(2)
+        self.assertEqual(result["state"], "external_workload")
+        self.assertEqual(result["external_pids"], [9999])
+        self.assertEqual(set(pool.workers), {"GPU-B"})
+
+    def test_ready_arriving_during_sample_waits_for_a_fresh_sample(self):
+        pool = self.use_isolated_pool(ready=False)
+        original_sample = self.monitor.sample
+
+        def sample(selected):
+            for worker in pool.workers.values():
+                worker.ready.set()
+            return original_sample(selected)
+
+        self.monitor.sample = sample
+        self.assertEqual(self.supervisor.step(1)["state"], "worker_starting")
+        self.assertFalse(pool.own_pids("GPU-A"))
+        self.assertEqual(self.supervisor.step(2)["state"], "running")
+        self.assertEqual(pool.own_pids("GPU-A"), {9000})
+
+    def test_reservation_still_releases_an_initializing_isolated_worker(self):
+        pool = self.use_isolated_pool(ready=False)
+        self.request(gpus=["GPU-A"])
+        result = self.supervisor.step(1)
+        self.assertEqual(result["state"], "reserved")
+        self.assertEqual(set(pool.workers), {"GPU-B"})
+        self.assertTrue((self.control / "acks" / "req.json").exists())
 
     def request(self, name="req", gpus=None):
         data = {"version": 1, "id": name, "owner": identity_record(os.getpid()), "gpus": gpus or ["GPU-A", "GPU-B"]}

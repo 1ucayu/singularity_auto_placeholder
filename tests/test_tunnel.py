@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -13,7 +14,7 @@ import time
 import unittest
 from unittest import mock
 
-from singularity_placeholder import tunnel
+from singularity_placeholder import parent_exec, tunnel
 
 
 class TunnelTests(unittest.TestCase):
@@ -108,6 +109,65 @@ class TunnelTests(unittest.TestCase):
                                   dict(os.environ), threading.Event(), self.logger, timeout=0.2)
         self.assertEqual(result, 124)
 
+    def test_child_exec_preserves_command_and_environment(self):
+        output = self.root / "child-env"
+        program = ("import os,sys; from pathlib import Path; "
+                   "Path(sys.argv[1]).write_text(os.environ['TUNNEL_TEST_VALUE'] + ':' + sys.argv[2])")
+        environment = dict(os.environ, TUNNEL_TEST_VALUE="unchanged value")
+        result = tunnel.run_child([sys.executable, "-c", program, str(output), "one argument with spaces"],
+                                  environment, threading.Event(), self.logger)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.read_text(), "unchanged value:one argument with spaces")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death signal integration")
+    def test_crashed_tunnel_helper_terminates_its_detached_cli(self):
+        pidfile = self.root / "orphan-cli.pid"
+        child_code = ("import os,time; from pathlib import Path; "
+                      f"Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)")
+        helper_code = (
+            "import logging,os,sys,threading; from singularity_placeholder import tunnel; "
+            f"tunnel.run_child([sys.executable, '-c', {child_code!r}], dict(os.environ), "
+            "threading.Event(), logging.getLogger('parent-death-integration'))"
+        )
+        helper = subprocess.Popen([sys.executable, "-c", helper_code], start_new_session=True,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cli_pid = None
+
+        def running(pid):
+            try:
+                # Orphans may briefly remain zombies under a container PID 1.
+                # A zombie has already exited and cannot hold a tunnel socket.
+                status = Path(f"/proc/{pid}/stat").read_text()
+                return status.rsplit(")", 1)[1].split()[0] != "Z"
+            except FileNotFoundError:
+                return False
+
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    cli_pid = int(pidfile.read_text())
+                    break
+                except (FileNotFoundError, ValueError):
+                    time.sleep(0.02)
+            self.assertIsNotNone(cli_pid, "CLI was not launched")
+            self.assertTrue(running(cli_pid))
+            helper.kill()  # No helper finally block can run after SIGKILL.
+            helper.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while running(cli_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(running(cli_pid), "CLI survived the tunnel helper's death")
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+            helper.wait(timeout=5)
+            if cli_pid is not None:
+                try:
+                    os.killpg(cli_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_failure_budget_and_backoff_are_bounded(self):
         stop = mock.Mock()
         stop.is_set.return_value = False
@@ -153,6 +213,48 @@ class TunnelTests(unittest.TestCase):
                 mock.patch.object(tunnel, "install_cli", return_value=Path("/local/code")), \
                 mock.patch.object(tunnel, "run_child", side_effect=run):
             self.assertEqual(tunnel.supervise(self.root, "aml-lucayu", stop, self.logger), 0)
+
+
+class ParentExecTests(unittest.TestCase):
+    def test_parent_death_spawn_race_does_not_launch_cli(self):
+        with mock.patch.object(parent_exec, "arm_parent_death"), \
+                mock.patch.object(parent_exec.os, "getppid", return_value=1), \
+                mock.patch.object(parent_exec.os, "execvp") as execute:
+            self.assertEqual(parent_exec.main(["--parent-pid", "12345", "--", "/code", "tunnel"]), 0)
+        execute.assert_not_called()
+
+    def test_live_parent_executes_same_cli_arguments(self):
+        with mock.patch.object(parent_exec, "arm_parent_death") as arm, \
+                mock.patch.object(parent_exec.os, "getppid", return_value=12345), \
+                mock.patch.object(parent_exec.os, "execvp") as execute:
+            self.assertEqual(parent_exec.main(["--parent-pid", "12345", "--", "/code", "tunnel", "--name", "test"]), 0)
+        arm.assert_called_once_with()
+        execute.assert_called_once_with("/code", ["/code", "tunnel", "--name", "test"])
+
+    def test_linux_arms_parent_death_signal(self):
+        library = mock.Mock()
+        library.prctl.return_value = 0
+        with mock.patch.object(parent_exec.sys, "platform", "linux"), \
+                mock.patch.object(parent_exec.ctypes, "CDLL", return_value=library):
+            parent_exec.arm_parent_death()
+        library.prctl.assert_called_once_with(1, signal.SIGTERM, 0, 0, 0)
+
+    def test_unavailable_parent_death_setup_does_not_gate_exec(self):
+        output = io.StringIO()
+        with mock.patch.object(parent_exec.sys, "platform", "linux"), \
+                mock.patch.object(parent_exec.ctypes, "CDLL", side_effect=OSError("unsupported")), \
+                mock.patch.object(parent_exec.os, "getppid", return_value=12345), \
+                mock.patch.object(parent_exec.os, "execvp") as execute, \
+                mock.patch.object(parent_exec.sys, "stderr", output):
+            self.assertEqual(parent_exec.main(["--parent-pid", "12345", "--", "/code"]), 0)
+        execute.assert_called_once_with("/code", ["/code"])
+        self.assertIn("continuing normally", output.getvalue())
+
+    def test_non_linux_skips_optional_kernel_setup(self):
+        with mock.patch.object(parent_exec.sys, "platform", "darwin"), \
+                mock.patch.object(parent_exec.ctypes, "CDLL") as library:
+            parent_exec.arm_parent_death()
+        library.assert_not_called()
 
 
 if __name__ == "__main__":

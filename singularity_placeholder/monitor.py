@@ -144,7 +144,11 @@ def select_gpus(
     environ: Mapping[str, str] | None = None,
     cuda_visible: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
-    """Select only verified allocated devices, requiring an exact final count.
+    """Select the nonempty usable allocation without imposing an exact count.
+
+    ``count`` is the caller's expected GPU count, retained for compatibility and
+    caller diagnostics. A mismatch never expands, truncates, or rejects a
+    nonempty visible allocation; the supervisor can report an unexpected count.
 
     A CUDA probe can supersede a stale empty NVIDIA_VISIBLE_DEVICES startup
     hint. Explicit NVIDIA UUID restrictions remain enforced, and ambiguous
@@ -180,9 +184,9 @@ def select_gpus(
             raise MonitorError("--gpus requests a GPU outside the environment's visible allocation.")
         allowed = set(chosen)
     selected = tuple(gpu.uuid for gpu in inventory if gpu.uuid in allowed)
-    if len(selected) != count:
+    if not selected:
         raise MonitorError(
-            f"Expected exactly {count} allocated GPUs; safely resolved {len(selected)}. "
+            "No allocated GPUs are usable; safely resolved 0. "
             + visibility_diagnostics(env, inventory_count=len(inventory), cuda_visible=cuda_visible)
         )
     for gpu in inventory:

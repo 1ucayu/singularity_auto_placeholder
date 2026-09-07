@@ -20,7 +20,7 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--control-dir", type=Path, default=Path(default_control), help="Node-local control path; never a Blob/shared mount")
         if name == "supervise":
             item.add_argument("--state-dir", type=Path, default=None, help="Bounded log directory (defaults to control-dir/logs)")
-            item.add_argument("--gpu-count", type=int, default=8)
+            item.add_argument("--gpu-count", type=int, default=8, help="Expected GPU count; a mismatch is logged and usable GPUs still run")
             item.add_argument("--gpus", help="Comma-separated allocated GPU UUIDs or explicit nvidia-smi indices")
             item.add_argument("--idle-seconds", type=float, default=30.0)
             item.add_argument("--poll-seconds", type=float, default=2.0)

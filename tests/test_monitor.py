@@ -9,7 +9,7 @@ class SelectionTests(unittest.TestCase):
     def setUp(self):
         self.inventory = tuple(GPU(index, f"GPU-test{index}", 0, 0) for index in range(8))
 
-    def test_default_selects_exact_allocation(self):
+    def test_default_selects_visible_allocation(self):
         self.assertEqual(select_gpus(self.inventory, environ={}), tuple(g.uuid for g in self.inventory))
 
     def test_explicit_selection_intersects_both_masks(self):
@@ -39,11 +39,21 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(MonitorError):
                 select_gpus(self.inventory, environ={"NVIDIA_VISIBLE_DEVICES": raw})
 
-    def test_extra_or_missing_gpus_are_not_silently_selected(self):
-        with self.assertRaisesRegex(MonitorError, "exactly 4"):
-            select_gpus(self.inventory, count=4, environ={})
-        with self.assertRaises(MonitorError):
-            select_gpus(self.inventory[:2], environ={})
+    def test_expected_count_does_not_truncate_or_expand_visible_allocation(self):
+        self.assertEqual(
+            select_gpus(self.inventory, count=4, environ={}),
+            tuple(gpu.uuid for gpu in self.inventory),
+        )
+        self.assertEqual(
+            select_gpus(self.inventory[:2], count=8, environ={}),
+            ("GPU-test0", "GPU-test1"),
+        )
+
+    def test_explicit_subset_does_not_require_matching_expected_count(self):
+        self.assertEqual(
+            select_gpus(self.inventory, count=8, selectors="2,6", environ={}),
+            ("GPU-test2", "GPU-test6"),
+        )
 
     def test_mig_is_rejected(self):
         with self.assertRaisesRegex(MonitorError, "MIG"):
@@ -72,10 +82,8 @@ class CudaSelectionTests(unittest.TestCase):
     def test_explicit_container_uuid_restriction_is_preserved(self):
         env = {"NVIDIA_VISIBLE_DEVICES": "GPU-test0"}
         actual = ("GPU-test0", "GPU-test1")
-        with self.assertRaisesRegex(MonitorError, "Expected exactly 2.*resolved 1"):
-            select_gpus(self.inventory, count=2, environ=env, cuda_visible=actual)
         self.assertEqual(
-            select_gpus(self.inventory, count=1, environ=env, cuda_visible=actual),
+            select_gpus(self.inventory, count=2, environ=env, cuda_visible=actual),
             ("GPU-test0",),
         )
         with self.assertRaisesRegex(MonitorError, "outside"):
@@ -154,9 +162,29 @@ class CudaSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(MonitorError, "MIG"):
             select_gpus((GPU(0, "GPU-test0", 0, 0, "Enabled"),), count=1, environ={}, cuda_visible=("GPU-test0",))
 
-    def test_cuda_probe_does_not_relax_exact_count_requirement(self):
-        with self.assertRaisesRegex(MonitorError, "Expected exactly 8.*resolved 7"):
-            select_gpus(self.inventory, environ={}, cuda_visible=self.visible[:7])
+    def test_fewer_cuda_visible_gpus_remain_usable(self):
+        for actual_count in (1, 4, 7):
+            with self.subTest(actual_count=actual_count):
+                actual = self.visible[:actual_count]
+                self.assertEqual(
+                    select_gpus(self.inventory, count=8, environ={}, cuda_visible=actual),
+                    actual,
+                )
+
+    def test_lower_expected_count_does_not_truncate_cuda_allocation(self):
+        self.assertEqual(
+            select_gpus(self.inventory, count=4, environ={}, cuda_visible=self.visible),
+            self.visible,
+        )
+
+    def test_expected_count_never_adds_gpus_outside_cuda_allocation(self):
+        actual = ("GPU-test2", "GPU-test6")
+        self.assertEqual(
+            select_gpus(self.inventory, count=8, environ={}, cuda_visible=actual),
+            actual,
+        )
+        with self.assertRaisesRegex(MonitorError, "outside"):
+            select_gpus(self.inventory, count=8, selectors="0,2,6", environ={}, cuda_visible=actual)
 
     def test_invalid_cuda_masks_still_fail(self):
         for raw in ("0,0", "0,GPU-test1", "GPU-test1,", "GPU-test1,GPU-test1", "0,1"):

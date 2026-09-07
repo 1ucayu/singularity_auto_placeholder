@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "singularity-auto-placeholder"
 version = "0.1.0"
-description = "Foreground GPU placeholder supervisor for a single-node Azure ML job"
+description = "Independent GPU placeholder and VS Code tunnel services for a single-node Azure ML job"
 requires-python = ">=3.10"
 dependencies = []
 
