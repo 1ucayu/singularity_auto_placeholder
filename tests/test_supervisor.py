@@ -77,6 +77,18 @@ class SupervisorTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_production_discovery_uses_cuda_devices_despite_empty_nvidia_hint(self):
+        self.monitor.gpus = tuple(GPU(index, f"GPU-{index}", 0, 0) for index in range(8))
+        cuda = tuple(gpu.uuid for gpu in self.monitor.gpus)
+        with patch("singularity_placeholder.supervisor.NvidiaMonitor", return_value=self.monitor), \
+                patch("singularity_placeholder.supervisor.discover_cuda_uuids", return_value=cuda) as probe:
+            supervisor = Supervisor(
+                Config(self.control, Path(self.temp.name) / "logs", gpu_count=8),
+                pool=self.pool, environ={"NVIDIA_VISIBLE_DEVICES": ""},
+            )
+        self.assertEqual(supervisor.selected, cuda)
+        probe.assert_called_once_with(environ={"NVIDIA_VISIBLE_DEVICES": ""})
+
     def request(self, name="req", gpus=None):
         data = {"version": 1, "id": name, "owner": identity_record(os.getpid()), "gpus": gpus or ["GPU-A", "GPU-B"]}
         atomic_json(self.control / "requests" / f"{name}.json", data)

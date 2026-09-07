@@ -7,7 +7,7 @@ A foreground supervisor for **single-node Azure ML / Singularity jobs with 8 ful
 Configure the input as follows: name `lucayu`, type Folder, URI `azureml://datastores/zhiyuhe/paths/`, and Read-write mount. Paste this into **Run a custom training script → Command**:
 
 ```bash
-bash -lc 'set -euo pipefail; repo="$(mktemp -d /tmp/singularity-placeholder.XXXXXX)"; git clone --depth 1 https://github.com/1ucayu/singularity_auto_placeholder.git "$repo"; exec bash "$repo/scripts/aml_start.sh" --blob-root "$1" --gpu-count 8' _ "${{inputs.lucayu}}"
+env -u BASH_ENV bash --noprofile --norc -c 'set -euo pipefail; repo="$(mktemp -d /tmp/singularity-placeholder.XXXXXX)"; git clone --depth 1 https://github.com/1ucayu/singularity_auto_placeholder.git "$repo"; exec bash "$repo/scripts/aml_start.sh" --blob-root "$1" --gpu-count 8' _ "${{inputs.lucayu}}"
 ```
 
 This public repository can be cloned without authentication. Each new job installs the local launcher, checks the CUDA environment, creates a personal Blob directory, and starts the supervisor. There is no need to SSH into the job first or append `sleep`. The image must already provide `python3` (3.10+), CUDA-enabled `torch`, `nvidia-smi`, `git`, and Bash; startup does not replace your PyTorch/CUDA installation. If the correct Python executable is named `python`, set `PLACEHOLDER_PYTHON=python` before `exec bash`.
@@ -15,6 +15,10 @@ This public repository can be cloned without authentication. Each new job instal
 The command above follows `main` to pick up fixes. For reproducible experiments, pin a verified commit of this repository and record both the image version and the experiment code commit.
 
 AML replaces `${{inputs.lucayu}}` with the mounted directory inside the container. `azureml://...` is a resource URI, not a filesystem path you can pass to `cd`. Passing the input explicitly also resolves the `Missing inputs from command: lucayu` warning.
+
+Use the non-login shell above. An inner `bash -lc` reloads `/etc/profile` and the platform's profile scripts, which can produce unrelated startup errors. `--noprofile --norc` and removing `BASH_ENV` skip that additional initialization without changing CUDA visibility. The platform may still run its own outer startup scripts.
+
+GPU discovery queries the CUDA driver in an isolated process and matches its visible UUIDs against `nvidia-smi`. It honors `CUDA_VISIBLE_DEVICES`, including numeric subsets and ordering. Empty or disabled `NVIDIA_VISIBLE_DEVICES` container-launch hints no longer incorrectly hide GPUs that CUDA can actually access in an existing Common Runtime job. Explicit nonempty NVIDIA GPU restrictions still apply; ambiguous mappings produce an error rather than exposing additional GPUs. Startup logs include only GPU visibility settings and counts; they do not dump the job environment. Exactly `--gpu-count` devices must still be available.
 
 ### Start a VS Code tunnel as well (optional)
 
@@ -29,6 +33,8 @@ The new job downloads the official VS Code CLI and starts the tunnel automatical
 Login state is stored in a private directory on the node's local disk and can be reused when a process restarts within the same job. **Unattended login in a new job requires the platform to securely inject a valid `VSCODE_CLI_ACCESS_TOKEN`** (and a refresh token if required by the provider). An arbitrary repository PAT is not necessarily a compatible replacement. Without a usable credential, GitHub device-code login is still required. Token expiry, revocation, SSO, or network policy changes may require authentication again. Do not store credentials in Git, the Command string, or shared Blob storage. Using `--tunnel` accepts the VS Code Server license terms.
 
 Use different tunnel names for concurrent jobs. You can reuse `aml-lucayu` when replacing a job that has already ended. The GPU supervisor operates independently of tunnel startup success.
+
+If the supervisor exits with an error while the tunnel helper is alive, the session keeps the helper alive for up to 600 seconds for authentication and diagnostics, then exits with the supervisor's failure code. The window ends early if the tunnel helper exits. Set `--debug-grace-seconds 0` to disable it. This window does not guarantee GPU activity; check worker state after a supervisor crash. Platform reclamation or cancellation can still end the job earlier. CUDA/PyTorch preflight failures before the helper starts do not create a tunnel.
 
 ## 2. Use from VS Code
 
@@ -81,7 +87,7 @@ Local control state is stored in `/tmp/singularity-auto-<UID>/control/`, with lo
 
 The tool supports selecting allocated devices by full GPU UUID and does not guess the mapping from CUDA ordinals to physical GPUs. **Automatic process identification currently requires the job to use the host PID namespace with an aligned `/proc` mount.** In an isolated container PID namespace, host PIDs returned by NVML cannot be reliably matched to container PIDs. The tool reports an error before launching workers instead of guessing ownership. MIG, MPS, and isolated environments that hide other CUDA processes also require additional support. The namespace configuration of the current MSRA jobs has not been verified.
 
-When it encounters unknown processes or ambiguous monitoring data, the tool yields GPUs and reports the reason in its status. If `CUDA_VISIBLE_DEVICES` uses a partial list of numeric GPU ordinals, configure that mask with the full UUIDs allocated to the job. `--gpus` does not override or expand the existing visibility mask.
+When it encounters unknown processes or ambiguous monitoring data, the tool yields GPUs and reports the reason in its status. CUDA numeric ordinals are resolved to UUIDs by the CUDA driver; they are not guessed from `nvidia-smi` indices. `--gpus` does not override or expand the existing CUDA-visible allocation. If startup reports an unexpected GPU count, check the logged CUDA-visible count, NVIDIA inventory count, and visibility variables. An explicitly empty or disabled CUDA mask remains an error; the tool does not clear it to expose more GPUs.
 
 For configurable options, see:
 

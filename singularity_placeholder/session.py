@@ -39,7 +39,19 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-memory-mib", type=int, default=256)
     result.add_argument("--tunnel", action="store_true")
     result.add_argument("--tunnel-name", default="aml-lucayu")
+    result.add_argument("--debug-grace-seconds", type=float, default=600,
+                        help="Keep an enabled tunnel alive this long after supervisor failure (0 disables)")
     return result
+
+
+def supervisor_failure_action(returncode: int, *, tunnel_enabled: bool,
+                              grace_seconds: float, now: float, deadline: float | None) -> tuple[bool, float | None]:
+    """Return (should_exit, deadline), keeping a bounded tunnel debugging window."""
+    if returncode == 0 or not tunnel_enabled or grace_seconds <= 0:
+        return True, deadline
+    if deadline is None:
+        deadline = now + grace_seconds
+    return now >= deadline, deadline
 
 
 def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str]:
@@ -122,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,19}", args.tunnel_name):
         raise SystemExit("--tunnel-name must be 1-20 letters/digits/hyphens, starting with a letter or digit")
-    if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0:
+    if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.debug_grace_seconds < 0:
         raise SystemExit("GPU count and poll interval must be positive; idle interval must be nonnegative")
     preflight()
     paths = prepare_paths(args)
@@ -185,14 +197,27 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 children.append(tunnel)
             tunnel_reported = False
+            failure_deadline: float | None = None
             while not stopping:
                 result = supervisor.poll()
                 if result is not None:
-                    log(f"supervisor exited with code {result}; ending job entrypoint")
                     exit_code = result if result >= 0 else 128 - result
-                    break
+                    first_failure = failure_deadline is None
+                    should_exit, failure_deadline = supervisor_failure_action(
+                        result, tunnel_enabled=args.tunnel and tunnel.poll() is None,
+                        grace_seconds=args.debug_grace_seconds,
+                        now=time.monotonic(), deadline=failure_deadline,
+                    )
+                    if should_exit:
+                        log(f"supervisor exited with code {result}; ending job entrypoint")
+                        break
+                    if first_failure:
+                        log(f"supervisor exited with code {result}; GPU supervision stopped; check worker state. "
+                            f"Keeping the tunnel available for up to {args.debug_grace_seconds:g}s for diagnostics; "
+                            "the platform may still reclaim the job.")
                 if args.tunnel and tunnel.poll() is not None and not tunnel_reported:
-                    log(f"tunnel helper exited with code {tunnel.returncode}; see tunnel logs; GPU supervisor continues")
+                    supervisor_state = "GPU supervisor continues" if result is None else "GPU supervisor has also exited"
+                    log(f"tunnel helper exited with code {tunnel.returncode}; see tunnel logs; {supervisor_state}")
                     tunnel_reported = True
                 time.sleep(0.25)
         finally:

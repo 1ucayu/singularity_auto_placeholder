@@ -1,7 +1,8 @@
 """Conservative, dependency-free NVIDIA GPU monitoring.
 
-Only GPU UUIDs cross the worker boundary. Partial numeric visibility masks are
-ambiguous between CUDA, NVML, and container ordinals, so they are rejected.
+Only GPU UUIDs cross the worker boundary. Production startup corroborates the
+allocation with actual CUDA-visible UUIDs. Without that probe, partial numeric
+masks are ambiguous between CUDA and NVML ordinals and are rejected.
 """
 
 from __future__ import annotations
@@ -74,14 +75,82 @@ def _environment_mask(name: str, raw: str | None, inventory: Sequence[GPU]) -> s
     return {_uuid_token(token, inventory) for token in tokens}
 
 
+def visibility_diagnostics(
+    environ: Mapping[str, str] | None = None, *, inventory_count: int | None = None,
+    cuda_visible: Sequence[str] | None = None,
+) -> str:
+    """Describe only GPU visibility settings; never dump the job environment."""
+    env = os.environ if environ is None else environ
+    details = []
+    for name in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
+        raw = env.get(name)
+        value = "<unset>" if raw is None else repr(raw[:1024] + ("..." if len(raw) > 1024 else ""))
+        details.append(f"{name}={value}")
+    if inventory_count is not None:
+        details.append(f"nvidia-smi_count={inventory_count}")
+    if cuda_visible is not None:
+        details.append(f"cuda_visible_count={len(cuda_visible)}")
+    return "; ".join(details)
+
+
+def _cuda_allocation(
+    inventory: Sequence[GPU], cuda_visible: Sequence[str], environ: Mapping[str, str],
+) -> set[str]:
+    """Constrain selection to devices the current CUDA environment can access."""
+    if len(cuda_visible) != len(set(cuda_visible)):
+        raise MonitorError("CUDA returned duplicate GPU UUIDs.")
+    available = {gpu.uuid for gpu in inventory}
+    for value in cuda_visible:
+        if value.startswith("MIG-"):
+            raise MonitorError("MIG allocations are not supported; use a full-GPU job.")
+        if value not in available:
+            raise MonitorError(
+                f"CUDA-visible UUID {value!r} is absent from the nvidia-smi full-GPU inventory; "
+                "MIG or inconsistent container GPU visibility is unsupported."
+            )
+    allowed = set(cuda_visible)
+    container_hint = environ.get("NVIDIA_VISIBLE_DEVICES")
+    if container_hint is not None and container_hint.strip().lower() not in {"all", "", "none", "void", "-1"}:
+        # A stale empty startup hint can coexist with working CUDA access in
+        # managed containers. An explicit restriction is different: preserve
+        # UUID limits, and reject ambiguous partial numeric limits.
+        allowed &= _environment_mask("NVIDIA_VISIBLE_DEVICES", container_hint, inventory)
+    raw = environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None or raw.strip().lower() == "all":
+        return allowed
+    if raw.strip().lower() in {"", "none", "void", "-1"}:
+        # Never broaden an explicitly disabled CUDA allocation, even if the
+        # caller supplies an inconsistent probe result.
+        return set()
+    tokens = [token.strip() for token in raw.split(",")]
+    if any(not token for token in tokens) or len(tokens) != len(set(tokens)):
+        raise MonitorError("Invalid CUDA_VISIBLE_DEVICES mask: empty or duplicate selectors.")
+    if all(token.isdecimal() for token in tokens):
+        # CUDA has already mapped these ordinals (and CUDA_DEVICE_ORDER) to the
+        # returned UUIDs. They must not be interpreted as nvidia-smi indices.
+        if len(cuda_visible) > len(tokens):
+            raise MonitorError("CUDA reported more devices than the numeric CUDA_VISIBLE_DEVICES mask permits.")
+        return allowed
+    if any(token.isdecimal() for token in tokens):
+        raise MonitorError("Mixed numeric and UUID selectors in CUDA_VISIBLE_DEVICES are not supported.")
+    return allowed & {_uuid_token(token, inventory) for token in tokens}
+
+
 def select_gpus(
     inventory: Sequence[GPU],
     *,
     count: int = 8,
     selectors: str | None = None,
     environ: Mapping[str, str] | None = None,
+    cuda_visible: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
-    """Intersect explicit selection with both runtime allocation masks."""
+    """Select only verified allocated devices, requiring an exact final count.
+
+    A CUDA probe can supersede a stale empty NVIDIA_VISIBLE_DEVICES startup
+    hint. Explicit NVIDIA UUID restrictions remain enforced, and ambiguous
+    partial numeric NVIDIA masks are rejected. Without a probe, retain
+    conservative mask-only selection for injected monitors and offline callers.
+    """
     if count < 1 or not inventory:
         raise MonitorError("A positive GPU count and a non-empty NVIDIA inventory are required.")
     if len({gpu.uuid for gpu in inventory}) != len(inventory):
@@ -89,9 +158,12 @@ def select_gpus(
     if len({gpu.index for gpu in inventory}) != len(inventory):
         raise MonitorError("NVIDIA returned duplicate GPU indices.")
     env = os.environ if environ is None else environ
-    allowed = {gpu.uuid for gpu in inventory}
-    for name in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
-        allowed &= _environment_mask(name, env.get(name), inventory)
+    if cuda_visible is None:
+        allowed = {gpu.uuid for gpu in inventory}
+        for name in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            allowed &= _environment_mask(name, env.get(name), inventory)
+    else:
+        allowed = _cuda_allocation(inventory, cuda_visible, env)
     if selectors is not None:
         chosen: list[str] = []
         for token in (part.strip() for part in selectors.split(",")):
@@ -109,7 +181,10 @@ def select_gpus(
         allowed = set(chosen)
     selected = tuple(gpu.uuid for gpu in inventory if gpu.uuid in allowed)
     if len(selected) != count:
-        raise MonitorError(f"Expected exactly {count} allocated GPUs; safely resolved {len(selected)}.")
+        raise MonitorError(
+            f"Expected exactly {count} allocated GPUs; safely resolved {len(selected)}. "
+            + visibility_diagnostics(env, inventory_count=len(inventory), cuda_visible=cuda_visible)
+        )
     for gpu in inventory:
         if gpu.uuid in allowed and gpu.mig.lower() not in {"disabled", "n/a", "[n/a]", "not supported"}:
             raise MonitorError(f"GPU {gpu.uuid} has MIG mode {gpu.mig!r}; MIG is unsupported.")

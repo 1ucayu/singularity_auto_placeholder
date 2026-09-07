@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from .monitor import MonitorError, NvidiaMonitor, select_gpus
+from .cuda_probe import CudaProbeError, discover_cuda_uuids
+from .monitor import MonitorError, NvidiaMonitor, select_gpus, visibility_diagnostics
 
 
 LOG = logging.getLogger("singularity_placeholder")
@@ -434,14 +435,35 @@ class Config:
 
 
 class Supervisor:
-    def __init__(self, config: Config, *, monitor: Any = None, pool: Any = None, environ: Any = None):
+    def __init__(self, config: Config, *, monitor: Any = None, pool: Any = None, environ: Any = None, cuda_visible: Any = None):
         self.config = config
         self.control = ensure_local_control_dir(config.control_dir)
         self.monitor = monitor or NvidiaMonitor()
         self.pool = pool or WorkerPool(config.worker_stop_seconds)
+        inventory = self.monitor.inventory()
+        LOG.info("GPU startup hints: %s", visibility_diagnostics(environ, inventory_count=len(inventory)))
+        if monitor is None:
+            try:
+                cuda_visible = discover_cuda_uuids(environ=environ)
+            except CudaProbeError as exc:
+                raise MonitorError(f"Cannot determine the actual CUDA-visible allocation: {exc}") from exc
+        LOG.info("GPU runtime discovery: %s", visibility_diagnostics(
+            environ, inventory_count=len(inventory), cuda_visible=cuda_visible,
+        ))
         self.selected = select_gpus(
-            self.monitor.inventory(), count=config.gpu_count, selectors=config.gpus, environ=environ,
+            inventory, count=config.gpu_count, selectors=config.gpus, environ=environ,
+            cuda_visible=cuda_visible,
         )
+        if sys.platform.startswith("linux"):
+            for label, path in (("current", "/proc/self/ns/pid"), ("proc_root", "/proc/1/ns/pid")):
+                try:
+                    LOG.info("PID namespace %s: %s", label, os.readlink(path))
+                except OSError as exc:
+                    LOG.warning("PID namespace %s is unreadable: %s", label, exc)
+            try:
+                WorkerPool._verify_pid_namespace()
+            except RuntimeError as exc:
+                LOG.error("Automatic placeholder workers are unavailable in this PID namespace: %s", exc)
         self.reservations = Reservations(self.control)
         self.daemon = {**identity_record(os.getpid()), "session": uuid.uuid4().hex}
         self.idle_since: dict[str, float] = {}

@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from singularity_placeholder.monitor import GPU, MonitorError, NvidiaMonitor, Snapshot, select_gpus
+from singularity_placeholder.monitor import GPU, MonitorError, NvidiaMonitor, Snapshot, select_gpus, visibility_diagnostics
 
 
 class SelectionTests(unittest.TestCase):
@@ -54,6 +54,126 @@ class SelectionTests(unittest.TestCase):
     def test_ambiguous_uuid_prefix_is_rejected(self):
         with self.assertRaises(MonitorError):
             select_gpus(self.inventory, count=1, selectors="GPU-test", environ={})
+
+
+class CudaSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.inventory = tuple(GPU(index, f"GPU-test{index}", 0, 0) for index in range(8))
+        self.visible = tuple(gpu.uuid for gpu in self.inventory)
+
+    def test_actual_cuda_allocation_supersedes_stale_container_hint(self):
+        for raw in ("", "none", "void", "-1", "all"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    select_gpus(self.inventory, environ={"NVIDIA_VISIBLE_DEVICES": raw}, cuda_visible=self.visible),
+                    self.visible,
+                )
+
+    def test_explicit_container_uuid_restriction_is_preserved(self):
+        env = {"NVIDIA_VISIBLE_DEVICES": "GPU-test0"}
+        actual = ("GPU-test0", "GPU-test1")
+        with self.assertRaisesRegex(MonitorError, "Expected exactly 2.*resolved 1"):
+            select_gpus(self.inventory, count=2, environ=env, cuda_visible=actual)
+        self.assertEqual(
+            select_gpus(self.inventory, count=1, environ=env, cuda_visible=actual),
+            ("GPU-test0",),
+        )
+        with self.assertRaisesRegex(MonitorError, "outside"):
+            select_gpus(self.inventory, count=1, selectors="1", environ=env, cuda_visible=actual)
+
+    def test_container_and_cuda_uuid_restrictions_are_intersected(self):
+        env = {"NVIDIA_VISIBLE_DEVICES": "GPU-test0,GPU-test1", "CUDA_VISIBLE_DEVICES": "GPU-test1,GPU-test2"}
+        self.assertEqual(
+            select_gpus(self.inventory, count=1, environ=env, cuda_visible=self.visible),
+            ("GPU-test1",),
+        )
+
+    def test_partial_numeric_container_restriction_is_not_guessed(self):
+        with self.assertRaisesRegex(MonitorError, "Partial numeric NVIDIA_VISIBLE_DEVICES=.*ambiguous"):
+            select_gpus(self.inventory, count=2, environ={"NVIDIA_VISIBLE_DEVICES": "0,1"}, cuda_visible=self.visible[:2])
+
+    def test_complete_numeric_container_hint_is_compatible_with_cuda_probe(self):
+        self.assertEqual(
+            select_gpus(self.inventory, environ={"NVIDIA_VISIBLE_DEVICES": "7,6,5,4,3,2,1,0"}, cuda_visible=self.visible),
+            self.visible,
+        )
+
+    def test_unknown_container_uuid_restriction_is_rejected(self):
+        with self.assertRaisesRegex(MonitorError, "does not identify"):
+            select_gpus(self.inventory, environ={"NVIDIA_VISIBLE_DEVICES": "GPU-other-container"}, cuda_visible=self.visible)
+
+    def test_container_filter_does_not_hide_inconsistent_numeric_cuda_probe(self):
+        env = {"NVIDIA_VISIBLE_DEVICES": "GPU-test0,GPU-test1", "CUDA_VISIBLE_DEVICES": "0,1"}
+        with self.assertRaisesRegex(MonitorError, "more devices than.*CUDA_VISIBLE_DEVICES"):
+            select_gpus(self.inventory, count=2, environ=env, cuda_visible=self.visible)
+
+    def test_cuda_zero_never_falls_back_to_nvidia_smi_or_container_hint(self):
+        for env in ({"NVIDIA_VISIBLE_DEVICES": "all"}, {"CUDA_VISIBLE_DEVICES": ""}, {"CUDA_VISIBLE_DEVICES": "-1"}):
+            with self.subTest(env=env), self.assertRaisesRegex(MonitorError, "safely resolved 0.*cuda_visible_count=0"):
+                select_gpus(self.inventory, environ=env, cuda_visible=())
+
+    def test_explicitly_disabled_cuda_mask_is_preserved(self):
+        for raw in ("", "none", "void", "-1"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(MonitorError, "safely resolved 0"):
+                select_gpus(self.inventory, environ={"CUDA_VISIBLE_DEVICES": raw}, cuda_visible=self.visible)
+
+    def test_numeric_cuda_mask_uses_actual_uuid_mapping(self):
+        # CUDA ordinal zero need not mean nvidia-smi index zero. The driver has
+        # applied this process's CUDA_DEVICE_ORDER and remapped the ordinals.
+        visible = ("GPU-test6", "GPU-test2")
+        env = {"CUDA_VISIBLE_DEVICES": "0,1", "CUDA_DEVICE_ORDER": "FASTEST_FIRST", "NVIDIA_VISIBLE_DEVICES": ""}
+        self.assertEqual(
+            select_gpus(self.inventory, count=2, environ=env, cuda_visible=visible),
+            ("GPU-test2", "GPU-test6"),
+        )
+        self.assertEqual(
+            select_gpus(self.inventory, count=1, selectors="6", environ=env, cuda_visible=visible),
+            ("GPU-test6",),
+        )
+        with self.assertRaisesRegex(MonitorError, "outside"):
+            select_gpus(self.inventory, count=1, selectors="0", environ=env, cuda_visible=visible)
+
+    def test_uuid_cuda_mask_still_constrains_actual_allocation(self):
+        self.assertEqual(
+            select_gpus(self.inventory, count=1, environ={"CUDA_VISIBLE_DEVICES": "GPU-test5"}, cuda_visible=self.visible),
+            ("GPU-test5",),
+        )
+
+    def test_unknown_or_duplicate_cuda_uuid_is_rejected(self):
+        for visible in (("GPU-not-in-inventory",), ("GPU-test0", "GPU-test0")):
+            with self.subTest(visible=visible), self.assertRaises(MonitorError):
+                select_gpus(self.inventory, count=len(visible), environ={}, cuda_visible=visible)
+
+    def test_missing_uuid_in_cuda_mask_is_rejected(self):
+        with self.assertRaisesRegex(MonitorError, "does not identify"):
+            select_gpus(self.inventory, count=1, environ={"CUDA_VISIBLE_DEVICES": "GPU-not-present"}, cuda_visible=self.visible)
+
+    def test_mig_cuda_allocation_is_rejected(self):
+        with self.assertRaisesRegex(MonitorError, "MIG"):
+            select_gpus(self.inventory, count=1, environ={}, cuda_visible=("MIG-slice0",))
+        with self.assertRaisesRegex(MonitorError, "MIG"):
+            select_gpus((GPU(0, "GPU-test0", 0, 0, "Enabled"),), count=1, environ={}, cuda_visible=("GPU-test0",))
+
+    def test_cuda_probe_does_not_relax_exact_count_requirement(self):
+        with self.assertRaisesRegex(MonitorError, "Expected exactly 8.*resolved 7"):
+            select_gpus(self.inventory, environ={}, cuda_visible=self.visible[:7])
+
+    def test_invalid_cuda_masks_still_fail(self):
+        for raw in ("0,0", "0,GPU-test1", "GPU-test1,", "GPU-test1,GPU-test1", "0,1"):
+            with self.subTest(raw=raw), self.assertRaises(MonitorError):
+                select_gpus(self.inventory, environ={"CUDA_VISIBLE_DEVICES": raw}, cuda_visible=self.visible)
+
+    def test_diagnostics_allowlist_and_escape_environment_values(self):
+        detail = visibility_diagnostics(
+            {"NVIDIA_VISIBLE_DEVICES": "", "CUDA_VISIBLE_DEVICES": "0\n1", "GITHUB_TOKEN": "must-stay-secret", "OTHER": "secret"},
+            inventory_count=8, cuda_visible=(),
+        )
+        self.assertIn("NVIDIA_VISIBLE_DEVICES=''", detail)
+        self.assertIn("CUDA_VISIBLE_DEVICES='0\\n1'", detail)
+        self.assertIn("CUDA_DEVICE_ORDER=<unset>", detail)
+        self.assertNotIn("\n", detail)
+        self.assertNotIn("secret", detail)
+        self.assertIn("nvidia-smi_count=8; cuda_visible_count=0", detail)
 
 
 class MonitorTests(unittest.TestCase):
