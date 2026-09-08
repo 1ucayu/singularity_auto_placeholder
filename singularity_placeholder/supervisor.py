@@ -289,10 +289,14 @@ class Worker:
 
 
 class WorkerPool:
-    def __init__(self, stop_seconds: float = 10.0, startup_seconds: float = 120.0):
+    def __init__(self, stop_seconds: float = 10.0, startup_seconds: float = 120.0,
+                 *, matrix_size: int = 4096):
+        if type(matrix_size) is not int or not 256 <= matrix_size <= 8192:
+            raise ValueError("matrix_size must be an integer between 256 and 8192")
         self.workers: dict[str, Worker] = {}
         self.stop_seconds = stop_seconds
         self.startup_seconds = startup_seconds
+        self.matrix_size = matrix_size
 
     def own_pids(self, gpu: str) -> set[int]:
         worker = self.workers.get(gpu)
@@ -382,6 +386,7 @@ class WorkerPool:
                     env.pop(name, None)
                 process = subprocess.Popen(
                     [sys.executable, "-m", "singularity_placeholder.worker", "--gpu", gpu,
+                     "--matrix-size", str(self.matrix_size),
                      "--parent-pid", str(os.getpid())],
                     env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, start_new_session=True,
@@ -460,7 +465,7 @@ class WorkerPool:
 class Config:
     control_dir: Path
     state_dir: Path
-    gpu_count: int = 8
+    gpu_count: int | None = None
     gpus: str | None = None
     idle_seconds: float = 30.0
     poll_seconds: float = 2.0
@@ -468,6 +473,13 @@ class Config:
     max_memory_mib: int = 256
     worker_stop_seconds: float = 10.0
     worker_retry_seconds: float = 60.0
+    matrix_size: int = 4096
+
+    def __post_init__(self) -> None:
+        if self.gpu_count is not None and (type(self.gpu_count) is not int or self.gpu_count < 1):
+            raise ValueError("gpu_count must be a positive integer or None for automatic discovery")
+        if type(self.matrix_size) is not int or not 256 <= self.matrix_size <= 8192:
+            raise ValueError("matrix_size must be an integer between 256 and 8192")
 
 
 class Supervisor:
@@ -475,7 +487,7 @@ class Supervisor:
         self.config = config
         self.control = ensure_local_control_dir(config.control_dir)
         self.monitor = monitor or NvidiaMonitor()
-        self.pool = pool or WorkerPool(config.worker_stop_seconds)
+        self.pool = pool or WorkerPool(config.worker_stop_seconds, matrix_size=config.matrix_size)
         inventory = self.monitor.inventory()
         LOG.info("GPU startup hints: %s", visibility_diagnostics(environ, inventory_count=len(inventory)))
         if monitor is None:
@@ -490,7 +502,7 @@ class Supervisor:
             inventory, count=config.gpu_count, selectors=config.gpus, environ=environ,
             cuda_visible=cuda_visible,
         )
-        if len(self.selected) != config.gpu_count:
+        if config.gpu_count is not None and len(self.selected) != config.gpu_count:
             LOG.warning("Requested %s GPUs but discovered %s usable GPUs; continuing with the visible allocation",
                         config.gpu_count, len(self.selected))
         if sys.platform.startswith("linux"):

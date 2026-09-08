@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "gpu_model": "A100",
+  "gpu_count": 4,
+  "gpus": null,
+  "blob_root": null,
+  "blob_prefix": "",
+  "local_root": null,
+  "tunnel": true,
+  "tunnel_name": null,
+  "aml": {
+    "input_name": "storage",
+    "datastore_uri": "azureml://datastores/my_datastore/paths/my-project/",
+    "repository": "https://github.com/1ucayu/singularity_auto_placeholder.git",
+    "ref": "main",
+    "keep_alive_seconds": 86400,
+    "clone_retry_seconds": 30
+  }
+}

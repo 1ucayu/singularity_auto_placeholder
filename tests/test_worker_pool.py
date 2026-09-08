@@ -50,11 +50,20 @@ class WorkerOwnershipTests(unittest.TestCase):
         with mock.patch("singularity_placeholder.supervisor.sys.platform", "linux"), \
                 mock.patch("singularity_placeholder.supervisor.os.readlink", return_value="pid:[4026539999]"), \
                 mock.patch("singularity_placeholder.supervisor.subprocess.Popen", return_value=process) as spawn:
-            pool = WorkerPool()
+            pool = WorkerPool(matrix_size=1536)
             pool.start(("GPU-A",))
         self.assertTrue(pool.workers["GPU-A"].ready.wait(1))
         self.assertEqual(pool.own_pids("GPU-A"), set())
         self.assertIn("--parent-pid", spawn.call_args.args[0])
+        command = spawn.call_args.args[0]
+        self.assertEqual(command[command.index("--matrix-size") + 1], "1536")
+
+    def test_matrix_size_bounds_are_checked_before_spawning(self):
+        for size in (255, 8193, 1024.5, "1024"):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                WorkerPool(matrix_size=size)
+        self.assertEqual(WorkerPool(matrix_size=256).matrix_size, 256)
+        self.assertEqual(WorkerPool(matrix_size=8192).matrix_size, 8192)
 
     def isolated_worker(self, *, ready=True):
         pool = WorkerPool()

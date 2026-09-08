@@ -109,6 +109,40 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.selected, ("GPU-A", "GPU-B"))
         self.assertIn("continuing with the visible allocation", "\n".join(logs.output))
 
+    def test_auto_count_uses_visible_allocation_without_a_count_warning(self):
+        self.monitor.gpus = tuple(GPU(index, f"GPU-{index}", 0, 0) for index in range(6))
+        with patch("singularity_placeholder.supervisor.LOG.warning") as warning:
+            supervisor = Supervisor(
+                Config(self.control, Path(self.temp.name) / "logs"),
+                monitor=self.monitor, pool=self.pool, environ={}, cuda_visible=("GPU-2", "GPU-5"),
+            )
+        self.assertEqual(supervisor.selected, ("GPU-2", "GPU-5"))
+        self.assertFalse(any("Requested" in str(call) for call in warning.call_args_list))
+        self.assertIs(supervisor.pool, self.pool)
+
+    def test_small_expected_count_does_not_truncate_usable_allocation(self):
+        with self.assertLogs("singularity_placeholder", level="WARNING"):
+            supervisor = Supervisor(
+                Config(self.control, Path(self.temp.name) / "logs", gpu_count=1),
+                monitor=self.monitor, pool=self.pool, environ={},
+            )
+        self.assertEqual(supervisor.selected, ("GPU-A", "GPU-B"))
+
+    def test_configured_matrix_size_reaches_default_worker_pool(self):
+        supervisor = Supervisor(
+            Config(self.control, Path(self.temp.name) / "logs", matrix_size=2048),
+            monitor=self.monitor, environ={},
+        )
+        self.assertEqual(supervisor.pool.matrix_size, 2048)
+
+    def test_invalid_runtime_configuration_is_rejected(self):
+        for count in (0, -1, True, 1.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                Config(self.control, Path(self.temp.name) / "logs", gpu_count=count)
+        for size in (255, 8193, 1024.5, "1024"):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                Config(self.control, Path(self.temp.name) / "logs", matrix_size=size)
+
     def use_isolated_pool(self, *, ready=True):
         pool = WorkerPool()
         reader = threading.Thread(target=lambda: None)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Singularity Placeholder"
+  short_description: "Interview and configure an AML GPU placeholder"
+  default_prompt: "Use $singularity-placeholder to interview me and prepare a GPU placeholder profile for my AML job."

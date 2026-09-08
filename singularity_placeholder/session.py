@@ -7,7 +7,6 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-import re
 import shlex
 import signal
 import subprocess
@@ -16,6 +15,9 @@ import time
 import threading
 from dataclasses import dataclass
 import uuid
+
+from . import profile
+from .tunnel import local_filesystem
 
 
 def log(message: str) -> None:
@@ -27,36 +29,67 @@ def default_local_root() -> Path:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--blob-root", type=Path, required=True,
-                        help="Actual mounted directory: pass Azure ML ${{inputs.lucayu}}")
-    result.add_argument("--blob-prefix", default="lucayu/sglang")
-    result.add_argument("--local-root", type=Path, default=default_local_root())
-    result.add_argument("--gpu-count", type=int, default=8,
-                        help="Expected GPU count; a mismatch does not block startup")
+    result = argparse.ArgumentParser(description=__doc__, argument_default=argparse.SUPPRESS)
+    result.add_argument("--config", type=Path, help="JSON profile; explicit CLI flags override its values")
+    result.add_argument("--dry-run", action="store_true", help="Print the resolved configuration without creating paths or starting services")
+    blob = result.add_mutually_exclusive_group()
+    blob.add_argument("--blob-root", help="Actual mounted directory on this node; optional")
+    blob.add_argument("--no-blob", dest="blob_root", action="store_const", const=None,
+                      help="Disable Blob setup, overriding the profile")
+    result.add_argument("--blob-prefix", help="Relative suffix; empty means blob-root is already the final directory")
+    result.add_argument("--local-root", help="Node-local directory; defaults to /tmp/singularity-auto-<UID>")
+    result.add_argument("--gpu-count", type=lambda value: None if value.strip().lower() == "auto" else int(value),
+                        help="Expected count or auto; never allocates, limits or expands GPUs")
+    result.add_argument("--gpu-model", help="Planning metadata only, not a hardware filter")
     result.add_argument("--gpus", help="Explicit allocated physical GPU UUIDs, comma separated")
-    result.add_argument("--idle-seconds", type=float, default=30)
-    result.add_argument("--poll-seconds", type=float, default=1)
-    result.add_argument("--max-utilization", type=int, default=5)
-    result.add_argument("--max-memory-mib", type=int, default=256)
-    result.add_argument("--tunnel", action="store_true")
-    result.add_argument("--tunnel-name", default="aml-lucayu")
-    result.add_argument("--retry-seconds", type=float, default=10,
+    result.add_argument("--idle-seconds", type=float)
+    result.add_argument("--poll-seconds", type=float)
+    result.add_argument("--max-utilization", type=int)
+    result.add_argument("--max-memory-mib", type=int)
+    result.add_argument("--matrix-size", type=int)
+    result.add_argument("--worker-stop-seconds", type=float)
+    result.add_argument("--worker-retry-seconds", type=float)
+    result.add_argument("--tunnel", action=argparse.BooleanOptionalAction)
+    result.add_argument("--tunnel-name", help="Unique 1-20 character name; generated when omitted")
+    result.add_argument("--retry-seconds", type=float,
                         help="Delay before restarting a failed service or retrying Blob setup")
     return result
 
 
-def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str]:
+def parse_options(argv: list[str] | None = None) -> tuple[argparse.Namespace, bool]:
+    overrides = vars(parser().parse_args(argv))
+    config = profile.load(overrides.pop("config", None))
+    dry_run = overrides.pop("dry_run", False)
+    config.update(overrides)
+    if "blob_root" in overrides:
+        # The CLI has resolved or disabled the input. Persist an unambiguous
+        # runtime profile that can itself be validated and reused.
+        config["aml"]["datastore_uri"] = None
+        if overrides["blob_root"] is None and "blob_prefix" not in overrides:
+            config["blob_prefix"] = ""
+    config["local_root"] = config["local_root"] or str(default_local_root())
+    config = profile.normalize(config)
+    if not dry_run and config["aml"]["datastore_uri"] and config["blob_root"] is None:
+        raise ValueError("Pass --blob-root with the actual AML mount, or use profile render-aml for a new job")
+    if config["blob_prefix"] and not (config["blob_root"] or config["aml"]["datastore_uri"]):
+        raise ValueError("blob_prefix needs a Blob root; use --blob-root or --no-blob")
+    return argparse.Namespace(**config), dry_run
+
+
+def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str | None]:
     # Do not touch Blob here: a slow/unavailable mount must not delay the tunnel.
-    mount = Path(os.path.abspath(args.blob_root.expanduser()))
+    mount = Path(os.path.abspath(Path(args.blob_root).expanduser())) if args.blob_root is not None else None
     prefix = Path(args.blob_prefix)
-    if prefix.is_absolute() or ".." in prefix.parts or not prefix.parts:
-        raise ValueError("--blob-prefix must be a nonempty relative path without '..'")
-    persistent = mount / prefix
-    local = Path(os.path.abspath(args.local_root.expanduser()))
-    if local.is_relative_to(mount) or mount.is_relative_to(local):
+    if prefix.is_absolute() or ".." in prefix.parts:
+        raise ValueError("--blob-prefix must be relative without '..'")
+    persistent = mount / prefix if mount is not None else None
+    local = Path(os.path.abspath(Path(args.local_root).expanduser()))
+    if mount is not None and (local.is_relative_to(mount) or mount.is_relative_to(local)):
         raise ValueError("--local-root must be separate from Blob; use a node-local SSD directory")
     local = local.resolve()
+    if mount is not None and (local.is_relative_to(mount) or mount.is_relative_to(local)):
+        raise ValueError("--local-root must be separate from Blob")
+    local_filesystem(local)
     # Keep generated launchers and control files private. Blob ACLs are managed
     # by Azure, so chmod on the Blob mount is intentionally not used.
     local.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -70,11 +103,11 @@ def prepare_paths(args: argparse.Namespace) -> dict[str, Path | str]:
     return {"mount": mount, "persistent": persistent, "local": local, "run_id": run_id}
 
 
-def write_environment(paths: dict[str, Path | str], repo: Path) -> dict[str, str]:
-    local, mount, persistent = (Path(paths[key]) for key in ("local", "mount", "persistent"))
+def write_environment(paths: dict[str, Path | str | None], repo: Path) -> dict[str, str]:
+    local = Path(paths["local"])
     values = {
-        "BLOB_MOUNT": str(mount),
-        "BLOB_ROOT": str(persistent),
+        "BLOB_MOUNT": str(paths["mount"]) if paths["mount"] is not None else "",
+        "BLOB_ROOT": str(paths["persistent"]) if paths["persistent"] is not None else "",
         "LOCAL_WORK_ROOT": str(local / "workspace"),
         "OUTPUT_ROOT": str(local / "outputs" / str(paths["run_id"])),
         "HF_HOME": str(local / "cache" / "huggingface"),
@@ -107,8 +140,10 @@ def write_environment(paths: dict[str, Path | str], repo: Path) -> dict[str, str
 
 
 
-def prepare_storage(paths: dict[str, Path | str], gpu_count: int) -> None:
+def prepare_storage(paths: dict[str, Path | str | None], gpu_count: int | None) -> None:
     """Best-effort durable layout; called in a thread, never on the tunnel path."""
+    if paths["mount"] is None:
+        return
     mount, persistent = Path(paths["mount"]), Path(paths["persistent"])
     if not mount.is_dir():
         raise OSError(f"Blob mount is not available: {mount}")
@@ -122,11 +157,12 @@ def prepare_storage(paths: dict[str, Path | str], gpu_count: int) -> None:
         "gpu_count_requested": gpu_count,
         "blob_root": str(persistent), "local_root": str(paths["local"]),
         "python": sys.version.split()[0],
+        "profile": paths.get("profile"),
     }
     (durable_session / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
-def storage_loop(paths: dict[str, Path | str], gpu_count: int,
+def storage_loop(paths: dict[str, Path | str | None], gpu_count: int | None,
                  stopping: threading.Event, retry_seconds: float) -> None:
     while not stopping.is_set():
         try:
@@ -194,11 +230,12 @@ def run_services(services: list[Service], stopping: threading.Event,
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,19}", args.tunnel_name):
-        raise SystemExit("--tunnel-name must be 1-20 letters/digits/hyphens, starting with a letter or digit")
-    if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.retry_seconds <= 0:
-        raise SystemExit("GPU count, poll interval and retry interval must be positive; idle interval must be nonnegative")
+    args, dry_run = parse_options(argv)
+    if dry_run:
+        print(json.dumps(vars(args), indent=2, allow_nan=False))
+        return 0
+    if args.tunnel and args.tunnel_name is None:
+        args.tunnel_name = "aml-" + uuid.uuid4().hex[:12]
     paths = prepare_paths(args)
     local = Path(paths["local"])
     repo = Path(__file__).resolve().parents[1]
@@ -209,6 +246,10 @@ def main(argv: list[str] | None = None) -> int:
         except BlockingIOError:
             log("another AML session already owns this local root")
             return 2
+        effective_profile = vars(args)
+        (local / "profile.json").write_text(json.dumps(effective_profile, indent=2) + "\n")
+        (local / "profile.json").chmod(0o600)
+        paths["profile"] = effective_profile
         values = write_environment(paths, repo)
         child_env = os.environ.copy()
         child_env.update(values)
@@ -222,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         services = []
         # Start the tunnel first. No CUDA, PyTorch or Blob checks gate connectivity.
         if args.tunnel:
+            log(f"VS Code tunnel name: {args.tunnel_name}")
             services.append(Service("tunnel", [
                 sys.executable, "-u", "-m", "singularity_placeholder.tunnel",
                 "--runtime-dir", str(local / "tunnel"), "--name", args.tunnel_name,
@@ -229,9 +271,11 @@ def main(argv: list[str] | None = None) -> int:
             ], child_env))
         command = [sys.executable, "-u", "-m", "singularity_placeholder", "supervise",
                    "--control-dir", str(local / "control"), "--state-dir", str(local / "logs"),
-                   "--gpu-count", str(args.gpu_count), "--idle-seconds", str(args.idle_seconds),
+                   "--gpu-count", str(args.gpu_count) if args.gpu_count is not None else "auto", "--idle-seconds", str(args.idle_seconds),
                    "--poll-seconds", str(args.poll_seconds), "--max-utilization", str(args.max_utilization),
-                   "--max-memory-mib", str(args.max_memory_mib)]
+                   "--max-memory-mib", str(args.max_memory_mib), "--matrix-size", str(args.matrix_size),
+                   "--worker-stop-seconds", str(args.worker_stop_seconds),
+                   "--worker-retry-seconds", str(args.worker_retry_seconds)]
         if args.gpus:
             command += ["--gpus", args.gpus]
         services.append(Service("GPU supervisor", command, supervisor_env))
@@ -239,9 +283,12 @@ def main(argv: list[str] | None = None) -> int:
         old_handlers = {}
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             old_handlers[sig] = signal.signal(sig, lambda *_: stopping.set())
-        storage = threading.Thread(target=storage_loop, args=(paths, args.gpu_count, stopping, args.retry_seconds),
-                                   name="blob-setup", daemon=True)
-        storage.start()
+        if args.blob_root is not None:
+            storage = threading.Thread(target=storage_loop, args=(paths, args.gpu_count, stopping, args.retry_seconds),
+                                       name="blob-setup", daemon=True)
+            storage.start()
+        else:
+            log("Blob storage disabled; outputs are node-local")
         try:
             run_services(services, stopping, args.retry_seconds)
         finally:

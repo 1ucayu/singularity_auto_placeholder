@@ -8,3 +8,5 @@ __pycache__/
 *.token
 runtime/
 outputs/
+generated/
+configs/*.local.json

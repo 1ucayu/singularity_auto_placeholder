@@ -11,6 +11,19 @@ import sys
 from .supervisor import Config, Supervisor, configure_logging, pause, reserved_child, resume, run_reserved, status
 
 
+def expected_gpu_count(value: str) -> int | None:
+    """Parse an optional expectation without selecting or limiting devices."""
+    if value.strip().lower() == "auto":
+        return None
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("GPU count must be a positive integer or 'auto'") from exc
+    if count < 1:
+        raise argparse.ArgumentTypeError("GPU count must be a positive integer or 'auto'")
+    return count
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Cooperative, foreground GPU placeholder supervisor")
     commands = root.add_subparsers(dest="action", required=True)
@@ -20,7 +33,8 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--control-dir", type=Path, default=Path(default_control), help="Node-local control path; never a Blob/shared mount")
         if name == "supervise":
             item.add_argument("--state-dir", type=Path, default=None, help="Bounded log directory (defaults to control-dir/logs)")
-            item.add_argument("--gpu-count", type=int, default=8, help="Expected GPU count; a mismatch is logged and usable GPUs still run")
+            item.add_argument("--gpu-count", type=expected_gpu_count, default=None,
+                              help="Expected GPU count or 'auto' (default); a mismatch is logged and usable GPUs still run")
             item.add_argument("--gpus", help="Comma-separated allocated GPU UUIDs or explicit nvidia-smi indices")
             item.add_argument("--idle-seconds", type=float, default=30.0)
             item.add_argument("--poll-seconds", type=float, default=2.0)
@@ -28,6 +42,8 @@ def parser() -> argparse.ArgumentParser:
             item.add_argument("--max-memory-mib", type=int, default=256)
             item.add_argument("--worker-stop-seconds", type=float, default=10.0)
             item.add_argument("--worker-retry-seconds", type=float, default=60.0)
+            item.add_argument("--matrix-size", type=int, default=4096,
+                              help="Square matrix size for each placeholder worker (256-8192)")
         elif name == "run":
             item.add_argument("--gpus", help="Comma-separated managed GPU ordinals or UUIDs; defaults to all. Sets the workload CUDA_VISIBLE_DEVICES.")
             item.add_argument("--ack-timeout", type=float, default=120.0)
@@ -45,10 +61,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.action == "supervise":
-            if args.gpu_count < 1 or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.worker_stop_seconds <= 0 or args.worker_retry_seconds <= 0:
+            if (args.gpu_count is not None and args.gpu_count < 1) or args.idle_seconds < 0 or args.poll_seconds <= 0 or args.worker_stop_seconds <= 0 or args.worker_retry_seconds <= 0:
                 raise ValueError("GPU count and polling/stop/retry durations must be positive; idle duration cannot be negative")
             if not 0 <= args.max_utilization <= 100 or args.max_memory_mib < 0:
                 raise ValueError("Invalid idle utilization or memory thresholds")
+            if not 256 <= args.matrix_size <= 8192:
+                raise ValueError("--matrix-size must be between 256 and 8192")
             state_dir = args.state_dir or args.control_dir / "logs"
             configure_logging(state_dir)
             return Supervisor(Config(
@@ -56,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
                 gpus=args.gpus, idle_seconds=args.idle_seconds, poll_seconds=args.poll_seconds,
                 max_utilization=args.max_utilization, max_memory_mib=args.max_memory_mib,
                 worker_stop_seconds=args.worker_stop_seconds, worker_retry_seconds=args.worker_retry_seconds,
+                matrix_size=args.matrix_size,
             )).run()
         if args.action in {"run", "_reserved-child"}:
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
