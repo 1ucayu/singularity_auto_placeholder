@@ -139,24 +139,27 @@ def _cuda_allocation(
 def select_gpus(
     inventory: Sequence[GPU],
     *,
-    count: int = 8,
+    count: int | None = None,
     selectors: str | None = None,
     environ: Mapping[str, str] | None = None,
     cuda_visible: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
     """Select the nonempty usable allocation without imposing an exact count.
 
-    ``count`` is the caller's expected GPU count, retained for compatibility and
-    caller diagnostics. A mismatch never expands, truncates, or rejects a
-    nonempty visible allocation; the supervisor can report an unexpected count.
+    ``count`` is an optional expected GPU count; None uses automatic discovery.
+    It is retained for compatibility and caller diagnostics. A mismatch never
+    expands, truncates, or rejects a nonempty visible allocation; the supervisor
+    can report an unexpected count.
 
     A CUDA probe can supersede a stale empty NVIDIA_VISIBLE_DEVICES startup
     hint. Explicit NVIDIA UUID restrictions remain enforced, and ambiguous
     partial numeric NVIDIA masks are rejected. Without a probe, retain
     conservative mask-only selection for injected monitors and offline callers.
     """
-    if count < 1 or not inventory:
-        raise MonitorError("A positive GPU count and a non-empty NVIDIA inventory are required.")
+    if count is not None and (type(count) is not int or count < 1):
+        raise MonitorError("Expected GPU count must be a positive integer or None for automatic discovery.")
+    if not inventory:
+        raise MonitorError("A non-empty NVIDIA inventory is required.")
     if len({gpu.uuid for gpu in inventory}) != len(inventory):
         raise MonitorError("NVIDIA returned duplicate GPU UUIDs.")
     if len({gpu.index for gpu in inventory}) != len(inventory):

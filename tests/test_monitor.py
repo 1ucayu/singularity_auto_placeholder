@@ -12,6 +12,24 @@ class SelectionTests(unittest.TestCase):
     def test_default_selects_visible_allocation(self):
         self.assertEqual(select_gpus(self.inventory, environ={}), tuple(g.uuid for g in self.inventory))
 
+    def test_auto_count_supports_non_eight_gpu_allocations(self):
+        for size in (1, 3, 6):
+            with self.subTest(size=size):
+                inventory = self.inventory[:size]
+                self.assertEqual(
+                    select_gpus(inventory, count=None, environ={}),
+                    tuple(gpu.uuid for gpu in inventory),
+                )
+
+    def test_auto_count_still_requires_a_nonempty_inventory(self):
+        with self.assertRaisesRegex(MonitorError, "non-empty NVIDIA inventory"):
+            select_gpus((), count=None, environ={})
+
+    def test_invalid_explicit_count_is_rejected(self):
+        for count in (0, -1, True, 1.5):
+            with self.subTest(count=count), self.assertRaisesRegex(MonitorError, "positive integer"):
+                select_gpus(self.inventory, count=count, environ={})
+
     def test_explicit_selection_intersects_both_masks(self):
         env = {"NVIDIA_VISIBLE_DEVICES": "GPU-test1,GPU-test3,GPU-test5", "CUDA_VISIBLE_DEVICES": "GPU-test3,GPU-test5"}
         self.assertEqual(select_gpus(self.inventory, count=1, selectors="GPU-test5", environ=env), ("GPU-test5",))
@@ -70,6 +88,19 @@ class CudaSelectionTests(unittest.TestCase):
     def setUp(self):
         self.inventory = tuple(GPU(index, f"GPU-test{index}", 0, 0) for index in range(8))
         self.visible = tuple(gpu.uuid for gpu in self.inventory)
+
+    def test_auto_count_respects_cuda_allocation_and_explicit_selectors(self):
+        actual = ("GPU-test2", "GPU-test6")
+        self.assertEqual(
+            select_gpus(self.inventory, count=None, environ={}, cuda_visible=actual),
+            actual,
+        )
+        self.assertEqual(
+            select_gpus(self.inventory, count=None, selectors="6", environ={}, cuda_visible=actual),
+            ("GPU-test6",),
+        )
+        with self.assertRaisesRegex(MonitorError, "outside"):
+            select_gpus(self.inventory, count=None, selectors="0,2,6", environ={}, cuda_visible=actual)
 
     def test_actual_cuda_allocation_supersedes_stale_container_hint(self):
         for raw in ("", "none", "void", "-1", "all"):
