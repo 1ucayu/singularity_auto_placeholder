@@ -53,7 +53,7 @@ The relay initially reports missing credentials and retries every ten seconds. G
 | `/tmp/singularity-secrets/id_jumper` | Authorized copy of the user's jump SSH key; source on Mac is `~/.ssh/id_jumper_sandbox_singularity`. |
 | `/tmp/singularity-secrets/known_hosts` | Verified host-key entry for `62.146.171.45`; do not disable host-key checking. |
 
-The directory must have mode 700. Both files must be owned by the actual session user; use mode 600. Derive that owner from the live `singularity_placeholder.session` process rather than assuming the SSH shell UID matches it. Keep key contents out of Git, the AML Command, logs and Blob. A destroyed job needs this node-local provisioning again. The companion `sglang_handson` topology guide provides the Mac provisioning helper.
+The directory must have mode 700. Both files must be owned by the actual session user; use mode 600. Derive that owner from the live `singularity_placeholder.session` process rather than assuming the SSH shell UID matches it. Keep key contents out of Git, the AML Command, logs and Blob. A destroyed job needs this node-local provisioning again. The [companion `sglang_handson` topology guide](https://github.com/1ucayu/sglang_handson/blob/codex/sandbox-singularity-topology/docs/SANDBOX_SINGULARITY_TOPOLOGY.md) provides the Mac provisioning helper and the complete sandbox/GPU setup.
 
 The jump account must allow stream-local forwarding and Python 3 execution. The helper creates a private socket directory, acquires a lock, and refuses to replace another live session. Remote TCP forwards are not used because the current jump server was observed to force public binds despite a loopback request. No jump `sshd` configuration change is necessary for this socket route.
 
@@ -68,17 +68,19 @@ ssh -N -T -o ExitOnForwardFailure=yes \
 
 The host-side agent can then use `http://127.0.0.1:30000/v1`. If the agent itself runs in a Docker container, its loopback is separate; the companion harness uses the CPU sandbox's host-side agent with Docker as its tool environment.
 
-On the GPU node, source the generated environment printed in the job log and check `placeholder status`. Stage code, the model and dependencies, then launch the authorized model server through the same manager, for example using the `sglang_handson` H100 recipe:
+On the GPU node, use a terminal belonging to the placeholder session's actual runtime user. Follow the companion guide to restore the `codex/sandbox-singularity-topology` branch of `sglang_handson`, then run these commands from that checkout in Bash:
 
 ```bash
-# First source the exact env.sh path printed in the job log.
-placeholder status
-# In the restored sglang_handson checkout, after its model/environment preflight:
 source scripts/env.sh
-placeholder run --gpus 0,1,2,3,4,5,6,7 -- ./scripts/serve_h100_fp8.sh
+placeholder status
+./scripts/bootstrap.sh --with-model --no-restore-code --no-watch
+"$SGLANG_PYTHON" -m por_modeling.gpu_service --preflight-only
+"$SGLANG_PYTHON" -u -m por_modeling.gpu_service
 ```
 
-Keep that wrapper in the foreground of its persistent terminal; do not start another occupancy program. Configure the server host as loopback and port as 30000. When the server exits and the GPUs satisfy the idle checks, placeholders resume. On the sandbox, verify the forwarded server before a benchmark:
+`--no-restore-code` prevents an old Blob source mirror from overwriting the new branch. `--no-watch` prevents the generic archive watcher from conflicting with this service's own periodic archival. The instrumented `por_modeling.gpu_service` preserves engine hooks, reserves all eight GPUs through `placeholder run` internally, and serves on `127.0.0.1:30000`. Do not wrap it in another `placeholder run` or start the ordinary `serve_h100_fp8.sh` alongside it.
+
+Keep the entire `gpu_service` command in the foreground of its persistent terminal. When that service exits and the GPUs satisfy the idle checks, placeholders resume. On the sandbox, verify the forwarded server before a benchmark:
 
 ```bash
 curl --fail --max-time 10 http://127.0.0.1:30000/health
