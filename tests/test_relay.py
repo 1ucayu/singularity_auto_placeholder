@@ -84,6 +84,16 @@ class RelayProfileTests(unittest.TestCase):
         })
         self.assertIn("sleep 8553600", command)
 
+    def test_checked_in_deployment_artifacts_match_pinned_profile(self):
+        repo = Path(__file__).resolve().parents[1]
+        config = profile.load(repo / "configs/sandbox-gpu-backend.json")
+        self.assertRegex(config["aml"]["ref"], r"^[a-f0-9]{40}$")
+        command, inputs = profile.render_aml(config)
+        generated = repo / "docs/sandbox-gpu-backend"
+        self.assertEqual((generated / "command.sh").read_text(), command)
+        self.assertEqual(json.loads((generated / "aml-inputs.json").read_text()), inputs)
+        self.assertEqual(json.loads((generated / "resolved-profile.json").read_text()), config)
+
 
 class RelayRuntimeTests(unittest.TestCase):
     def prepared(self, root):

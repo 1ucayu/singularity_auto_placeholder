@@ -1,0 +1,7 @@
+{
+  "lucayu": {
+    "type": "uri_folder",
+    "path": "azureml://datastores/zhiyuhe/paths/",
+    "mode": "rw_mount"
+  }
+}

@@ -99,4 +99,6 @@ to `relay.forwards`. A client can then map `127.0.0.1:22022` to that Unix socket
 
 ## Validation boundary
 
-The unit suite checks profile validation, missing-credential isolation, SSH command construction, private socket ownership, competing-session exclusion, stale-socket recovery and cleanup that preserves replacement sockets. No unit test starts CUDA, submits a job, downloads a model, or runs a SWE-bench instance. The new GPU allocation's CUDA, Blob mount, credentials and end-to-end inference still need live verification after provisioning.
+The unit suite checks profile validation, missing-credential isolation, SSH command construction, private socket ownership, competing-session exclusion, stale-socket recovery and cleanup that preserves replacement sockets. On 2026-09-11, the managed relay also passed two start/HTTP/stop cycles through the actual jump host using a CPU-only HTTP service on the Mac: both exits were zero, owned sockets were removed, and the same socket could reconnect. This verifies the SSH socket route and cleanup with the live jump host.
+
+No unit test starts CUDA, submits a job, downloads a model, or runs a SWE-bench instance. The new GPU allocation's CUDA, Blob mount, credentials and end-to-end inference still need live verification after provisioning.
