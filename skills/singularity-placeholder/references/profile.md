@@ -20,6 +20,14 @@ Without `blob_root` or `aml.datastore_uri`, the session is local-only. A datasto
 
 The desired GPU model and allocation size belong in AML's compute settings as well as any profile metadata. Do not claim the configuration enforces hardware compatibility. Full NVIDIA GPUs are supported; MIG and MPS workloads are outside the current scope.
 
+## Optional SSH relay object
+
+`relay.enabled` defaults to false. When enabled, provide `host`, `user`, `identity_file`, `known_hosts_file`, and a nonempty `forwards` list. Each forward has a private absolute `remote_socket` path on the jump host and a `local_port` on the GPU node's `127.0.0.1`. Only paths belong in the profile; provision credentials separately on node-local disk. The key must belong to the session user with mode 600. Strict host-key checking is always enabled.
+
+The jump SSH port defaults to 22. `connect_timeout`, `server_alive_interval`, and `server_alive_count_max` default to 15 seconds, 30 seconds, and 3. The jump host needs Python 3 and stream-local SSH forwarding; the GPU image needs the OpenSSH client. The independent relay retries through the session manager without stopping GPU supervision. The jump socket's parent directory must be owned by the jump user with mode 700. Its lease refuses active listeners, cleans refused stale sockets, and unlinks only its own socket inodes on normal shutdown. Use different socket paths for concurrent jobs.
+
+Remote TCP forwarding is deliberately unsupported because a server's `GatewayPorts` setting can override requested loopback binding. Clients can map a local loopback TCP port to the remote Unix socket with `ssh -L 127.0.0.1:30000:/private/remote/api.sock jump-host`. Enable optional GPU SSH forwarding only after verifying the node's existing SSH service and authentication. Relay readiness does not prove SGLang health or successful inference.
+
 ## AML object
 
 | Field | Default | Decision |

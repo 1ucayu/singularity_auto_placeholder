@@ -1,4 +1,4 @@
-"""Run the GPU supervisor and VS Code tunnel as independent, restartable services."""
+"""Run GPU supervision, SSH relay and VS Code tunnel as independent services."""
 
 from __future__ import annotations
 
@@ -269,6 +269,14 @@ def main(argv: list[str] | None = None) -> int:
                 "--runtime-dir", str(local / "tunnel"), "--name", args.tunnel_name,
                 "--log-dir", str(local / "logs" / "tunnel"),
             ], child_env))
+        if args.relay["enabled"]:
+            # Credential/mount/SSH checks happen only inside this child. A new
+            # job can occupy GPUs while node-local relay credentials are added.
+            services.append(Service("SSH relay", [
+                sys.executable, "-u", "-m", "singularity_placeholder.relay",
+                "--config", str(local / "profile.json"),
+                "--runtime-dir", str(local / "relay"),
+            ], supervisor_env))
         command = [sys.executable, "-u", "-m", "singularity_placeholder", "supervise",
                    "--control-dir", str(local / "control"), "--state-dir", str(local / "logs"),
                    "--gpu-count", str(args.gpu_count) if args.gpu_count is not None else "auto", "--idle-seconds", str(args.idle_seconds),

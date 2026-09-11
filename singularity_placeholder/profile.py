@@ -31,6 +31,18 @@ DEFAULTS = {
     "worker_stop_seconds": 10,
     "worker_retry_seconds": 60,
     "retry_seconds": 10,
+    "relay": {
+        "enabled": False,
+        "host": None,
+        "user": None,
+        "port": 22,
+        "identity_file": None,
+        "known_hosts_file": None,
+        "forwards": [],
+        "connect_timeout": 15,
+        "server_alive_interval": 30,
+        "server_alive_count_max": 3,
+    },
     "aml": {
         "input_name": "storage",
         "datastore_uri": None,
@@ -72,8 +84,9 @@ def normalize(data: object) -> dict:
     """Merge defaults and validate without probing the host or creating files."""
     data = _object(data, "profile", DEFAULTS)
     result = copy.deepcopy(DEFAULTS)
-    result.update({key: value for key, value in data.items() if key != "aml"})
-    result["aml"].update(_object(data.get("aml", {}), "aml", DEFAULTS["aml"]))
+    result.update({key: value for key, value in data.items() if key not in ("aml", "relay")})
+    for name in ("aml", "relay"):
+        result[name].update(_object(data.get(name, {}), name, DEFAULTS[name]))
     _number(result["schema_version"], "schema_version", integer=True, positive=True)
     if result["schema_version"] != 1:
         raise ValueError("Unsupported schema_version; expected 1")
@@ -118,6 +131,45 @@ def normalize(data: object) -> dict:
     _number(result["matrix_size"], "matrix_size", integer=True, minimum=256)
     if result["matrix_size"] > 8192:
         raise ValueError("matrix_size must be between 256 and 8192")
+    relay = result["relay"]
+    if type(relay["enabled"]) is not bool:
+        raise ValueError("relay.enabled must be a boolean")
+    for name in ("host", "user", "identity_file", "known_hosts_file"):
+        _string(relay[name], f"relay.{name}", nullable=not relay["enabled"])
+    if relay["host"] is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", relay["host"]):
+        raise ValueError("relay.host must be an IPv4 address or DNS hostname")
+    if relay["user"] is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", relay["user"]):
+        raise ValueError("relay.user must be an SSH username, without host or options")
+    for name in ("identity_file", "known_hosts_file"):
+        if relay[name] is not None:
+            path = Path(relay[name])
+            if not path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"relay.{name} must be an absolute node-local file path without '..'")
+            if any(char.isspace() or char in "\"'\\%$~" for char in relay[name]):
+                raise ValueError(f"relay.{name} must not contain whitespace, quoting or SSH expansion characters")
+            if result["blob_root"] and path.is_relative_to(Path(result["blob_root"])):
+                raise ValueError(f"relay.{name} must not be stored on Blob")
+    for name in ("port", "connect_timeout", "server_alive_interval", "server_alive_count_max"):
+        _number(relay[name], f"relay.{name}", positive=True, integer=True)
+    if relay["port"] > 65535:
+        raise ValueError("relay.port must be between 1 and 65535")
+    if not isinstance(relay["forwards"], list) or (relay["enabled"] and not relay["forwards"]):
+        raise ValueError("relay.forwards must be a list, nonempty when relay is enabled")
+    seen_sockets = set()
+    for forward in relay["forwards"]:
+        _object(forward, "relay.forwards entry", {"remote_socket": None, "local_port": None})
+        _number(forward.get("local_port"), "relay.forwards.local_port", positive=True, integer=True)
+        if forward["local_port"] > 65535:
+            raise ValueError("relay.forwards.local_port must be between 1 and 65535")
+        socket = forward.get("remote_socket")
+        _string(socket, "relay.forwards.remote_socket")
+        if (not socket.startswith("/") or ".." in Path(socket).parts
+                or not re.fullmatch(r"/[A-Za-z0-9_./-]+", socket)
+                or len(socket.encode()) > 100):
+            raise ValueError("relay.forwards.remote_socket must be a short absolute path using letters, digits, '_', '.', '-' and '/'")
+        if socket in seen_sockets:
+            raise ValueError("relay.forwards must have unique remote sockets")
+        seen_sockets.add(socket)
     aml = result["aml"]
     _string(aml["input_name"], "aml.input_name")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", aml["input_name"]):

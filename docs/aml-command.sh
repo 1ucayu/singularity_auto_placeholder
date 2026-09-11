@@ -30,6 +30,18 @@ trap "exit 129" HUP
   "worker_stop_seconds": 10,
   "worker_retry_seconds": 60,
   "retry_seconds": 10,
+  "relay": {
+    "enabled": false,
+    "host": null,
+    "user": null,
+    "port": 22,
+    "identity_file": null,
+    "known_hosts_file": null,
+    "forwards": [],
+    "connect_timeout": 15,
+    "server_alive_interval": 30,
+    "server_alive_count_max": 3
+  },
   "aml": {
     "input_name": "storage",
     "datastore_uri": "azureml://datastores/my_datastore/paths/my-project/",

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "gpu_model": "H100",
+  "gpu_count": 8,
+  "blob_prefix": "lucayu/sglang",
+  "tunnel": false,
+  "relay": {
+    "enabled": true,
+    "host": "62.146.171.45",
+    "user": "jumper",
+    "identity_file": "/tmp/singularity-secrets/id_jumper",
+    "known_hosts_file": "/tmp/singularity-secrets/known_hosts",
+    "forwards": [{"remote_socket": "/home/jumper/.sglang-relay/api.sock", "local_port": 30000}]
+  },
+  "aml": {
+    "input_name": "lucayu",
+    "datastore_uri": "azureml://datastores/zhiyuhe/paths/",
+    "ref": "codex/sandbox-singularity-topology",
+    "keep_alive_seconds": 8553600
+  }
+}

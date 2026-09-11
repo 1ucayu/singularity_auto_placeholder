@@ -1,8 +1,10 @@
 # Singularity Auto Placeholder
 
-Automatic per-GPU placeholders and an optional VS Code tunnel for a single-node Azure ML / Singularity job. Each GPU yields to real work independently. A JSON profile controls GPU expectations, selected devices, storage paths, local workspace, tunnel settings, and job lifetime; no personal datastore or GPU allocation is assumed.
+Automatic per-GPU placeholders with optional SSH relay and VS Code tunnel services for a single-node Azure ML / Singularity job. Each GPU yields to real work independently. A JSON profile controls GPU expectations, selected devices, storage paths, local workspace, access services, and job lifetime; no personal datastore or GPU allocation is assumed.
 
 The runtime targets full NVIDIA GPUs with ordinary CUDA processes. It discovers the GPUs available to the job; it does not request or expand a GPU allocation. GPU model names such as A100 and H100 are planning metadata. Choose the actual hardware, allocation size, image, and platform time limit when creating the AML job.
+
+For the **CPU sandbox + 8-H100 GPU backend** topology, use [the prepared profile and launch guide](docs/sandbox-gpu-backend.md). Docker benchmarks run on the sandbox; the GPU node serves SGLang through a private Unix socket on the SSH jump host. The relay is independent of GPU supervision, so pending credentials or a disconnected relay do not stop placeholders.
 
 ## Have an AI prepare the configuration
 

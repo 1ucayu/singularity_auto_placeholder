@@ -46,6 +46,35 @@ The session's `gpus` field selects physical allocated devices. The indices accep
 
 When both `blob_root` and `aml.datastore_uri` are null, storage is local-only. `OUTPUT_ROOT` always points at active local outputs; Blob setup does not upload them automatically. See [storage and recovery](storage-workflow.md).
 
+## SSH relay settings
+
+The optional `relay` object publishes node-local TCP services through private Unix sockets on a jump host. The runtime creates no reverse TCP listener: an SSH server with `GatewayPorts yes` can force a nominal loopback TCP forward onto public interfaces.
+
+| Field inside `relay` | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Start an independent, restartable SSH relay child. |
+| `host`, `user` | `null` | Jump host IPv4 address or DNS hostname, and SSH user; required when enabled. |
+| `port` | `22` | Jump SSH port. |
+| `identity_file` | `null` | Absolute node-local private-key path, owned by the session user, mode 600. Only a path belongs in the profile. |
+| `known_hosts_file` | `null` | Absolute node-local file containing verified jump host keys. Strict host-key checking is required. |
+| `forwards` | `[]` | Nonempty list when enabled. Each entry has `remote_socket` (private absolute path on the jump host) and `local_port` (TCP port on GPU `127.0.0.1`). |
+| `connect_timeout` | `15` | SSH connection timeout in seconds. |
+| `server_alive_interval` | `30` | Encrypted keepalive interval in seconds. |
+| `server_alive_count_max` | `3` | Unanswered keepalives before SSH exits; the session then retries. |
+
+The jump host needs OpenSSH stream-local forwarding, shell access and Python 3 with `fcntl`. The GPU image needs the OpenSSH client. Socket paths are limited to 100 bytes and their parent directory must belong to the jump user with mode 700. Credential paths cannot contain whitespace, quoting, SSH expansion characters, or `..`. Credentials and the SSH control socket must stay on node-local disk, outside Blob.
+
+Each relay acquires an advisory lock per remote socket. It refuses an existing live listener, removes refused stale sockets, creates forwards through an SSH control connection, and records the socket inodes before serving. Clean shutdown removes only those inodes. Reconnects clear stale sockets after acquiring the same lock; an active cooperating session cannot be replaced. Use different socket paths for concurrent jobs. The session's `retry_seconds` controls reconnect delay. Missing credentials, denied forwarding or unavailable jump access affect only this relay child.
+
+Client example, after the GPU relay is ready:
+
+```bash
+ssh -N -T -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:30000:/home/jumper/.sglang-relay/api.sock jumper-host
+```
+
+The client then uses `http://127.0.0.1:30000/v1`. `jumper-host` is an SSH alias configured with the appropriate jump hostname, key and verified host key. A successful relay alone does not establish that the model server is ready; check `/health` and `/v1/models` from the client.
+
 ## AML rendering settings
 
 These fields live inside the `aml` object:
